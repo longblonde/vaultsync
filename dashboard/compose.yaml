@@ -1,0 +1,15 @@
+services:
+  vaultsync:
+    build: .
+    image: vaultsync-dashboard:latest
+    container_name: vaultsync
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-8080}:8080"
+    environment:
+      AGENT_URL: ${AGENT_URL:?set AGENT_URL in .env, e.g. http://192.168.1.10:8710}
+      AGENT_TOKEN: ${AGENT_TOKEN:?set AGENT_TOKEN in .env (from /etc/vaultsync/config.json on the host)}
+      DB_PATH: /data/vaultsync.db
+      TZ: ${TZ:-America/Chicago}
+    volumes:
+      - ./data:/data
