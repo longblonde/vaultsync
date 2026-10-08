@@ -434,6 +434,33 @@ function closeModal() { if (modal.open) modal.close(); }
 modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
 modal.addEventListener("close", () => { modalBody.innerHTML = ""; });
 
+// Drive names must be unique (ignoring case), retired drives included.
+function nameClash(label, excludeId) {
+  const want = (label || "").trim().toLowerCase();
+  if (!want) return null;
+  const d = S.drives.find((x) => x.id !== excludeId && x.label.trim().toLowerCase() === want);
+  if (!d) return null;
+  return d.retired_at
+    ? `There's already a retired drive named “${d.label}”. Pick another name, or delete that drive first.`
+    : `There's already a drive named “${d.label}”. Pick another name.`;
+}
+
+function watchName(root, excludeId) {
+  const input = root.querySelector("[name=label]");
+  const submit = root.querySelector("[type=submit]");
+  const err = root.querySelector("#f-err");
+  const check = () => {
+    const msg = nameClash(input.value, excludeId);
+    input.setAttribute("aria-invalid", msg ? "true" : "false");
+    submit.disabled = !!msg;
+    err.textContent = msg || "";
+    return !msg;
+  };
+  input.addEventListener("input", check);
+  check();
+  return check;
+}
+
 function findUnknown(serial) { return S.unknown_disks.find((d) => d.serial === serial); }
 
 function maybePromptNewDrive() {
@@ -472,10 +499,12 @@ function setupModal(disk) {
   </form>`, (root) => {
     root.querySelector("[name=label]").focus();
     root.querySelector("[data-close]").onclick = closeModal;
+    const nameOk = watchName(root);
     root.querySelector("form").onsubmit = async (e) => {
       e.preventDefault();
       const f = new FormData(e.target);
       const err = root.querySelector("#f-err");
+      if (!nameOk()) return;
       if (f.get("confirm").trim() !== f.get("label").trim()) { err.textContent = "The confirmation doesn't match the drive name."; return; }
       try {
         e.submitter.disabled = true;
@@ -505,8 +534,10 @@ function adoptModal(disk) {
     <div class="modal-foot"><button type="button" data-close>Not now</button><button class="primary" type="submit">Add drive</button></div>
   </form>`, (root) => {
     root.querySelector("[data-close]").onclick = closeModal;
+    const nameOk = watchName(root);
     root.querySelector("form").onsubmit = async (e) => {
       e.preventDefault();
+      if (!nameOk()) return;
       const f = new FormData(e.target);
       try {
         await api("POST", "/api/drives/adopt", { pool: disk.pool, label: f.get("label"), custodian: f.get("custodian"), location: f.get("location") });
@@ -600,8 +631,10 @@ function editModal(id) {
       <div class="err" id="f-err"></div></div>
     <div class="modal-foot"><button type="button" data-close>Cancel</button><button class="primary" type="submit">Save changes</button></div></form>`, (root) => {
     root.querySelector("[data-close]").onclick = closeModal;
+    const nameOk = watchName(root, id);
     root.querySelector("form").onsubmit = async (e) => {
       e.preventDefault();
+      if (!nameOk()) return;
       const f = new FormData(e.target);
       try {
         await api("PATCH", `/api/drives/${id}`, { label: f.get("label"), notes: f.get("notes"), retired: !!f.get("retired") });

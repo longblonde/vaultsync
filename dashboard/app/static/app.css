@@ -91,6 +91,8 @@ input, select, textarea {
 }
 textarea { min-height: 70px; resize: vertical; }
 input:focus, select:focus, textarea:focus { outline: 2px solid var(--cobalt); outline-offset: -1px; }
+input[aria-invalid="true"] { border-color: var(--danger); }
+input[aria-invalid="true"]:focus { outline-color: var(--danger); }
 .check { display: flex; gap: 10px; align-items: center; font-size: 15px; color: var(--ink); }
 .check input { width: auto; }
 

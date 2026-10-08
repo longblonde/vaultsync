@@ -143,7 +143,8 @@ def ingest(jobs):
                     con.execute(
                         "INSERT INTO drives(id, pool, label, serial, model, capacity, custodian, location, notes, created_at)"
                         " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                        (res["drive_id"], res["pool"], res.get("label") or (pend and pend["label"]) or res["pool"],
+                        (res["drive_id"], res["pool"],
+                         unique_label(con, res.get("label") or (pend and pend["label"]) or res["pool"], res["drive_id"]),
                          res.get("serial"), res.get("model"), res.get("size"), custodian, location,
                          pend["notes"] if pend else "", j.get("finished") or now_iso()))
                     con.execute("INSERT INTO custody(drive_id, custodian, location, notes, started_at) VALUES (?,?,?,?,?)",
@@ -231,6 +232,31 @@ def get_state():
 # ---------------------------------------------------------------- drives
 
 
+def check_name(con, label, exclude_id=None):
+    """Drive names must be unique (ignoring case and surrounding spaces), including
+    retired drives and setups still in progress, so two drives never look alike."""
+    label = (label or "").strip()
+    if not label:
+        raise HTTPException(400, "give the drive a name")
+    r = con.execute("SELECT id, retired_at FROM drives WHERE label=? COLLATE NOCASE AND id IS NOT ?",
+                    (label, exclude_id)).fetchone()
+    if r:
+        extra = " (it's retired; delete it first to reuse the name)" if r["retired_at"] else ""
+        raise HTTPException(409, f"a drive named '{label}' already exists{extra}")
+    if con.execute("SELECT 1 FROM pending_inits WHERE label=? COLLATE NOCASE AND done=0", (label,)).fetchone():
+        raise HTTPException(409, f"a drive named '{label}' is being set up right now")
+    return label
+
+
+def unique_label(con, label, drive_id):
+    """For drives that arrive with a name already on them (set up from the shell):
+    keep the name if it's free, otherwise add a suffix."""
+    base, n, cand = label, 2, label
+    while con.execute("SELECT 1 FROM drives WHERE label=? COLLATE NOCASE AND id != ?", (cand, drive_id)).fetchone():
+        cand, n = f"{base} ({n})", n + 1
+    return cand
+
+
 def get_drive(con, drive_id):
     r = con.execute("SELECT * FROM drives WHERE id=?", (drive_id,)).fetchone()
     if not r:
@@ -263,10 +289,8 @@ class NewDrive(BaseModel):
 
 @app.post("/api/drives")
 def create_drive(body: NewDrive):
-    label = body.label.strip()
     with db() as con:
-        if con.execute("SELECT 1 FROM drives WHERE label=? COLLATE NOCASE AND retired_at IS NULL", (label,)).fetchone():
-            raise HTTPException(409, f"a drive named '{label}' already exists")
+        label = check_name(con, body.label)
     job = call("POST", "/api/jobs", {"kind": "init", "device": body.device, "serial": body.serial,
                                      "label": label, "confirm": body.confirm.strip()})
     with db() as con:
@@ -290,6 +314,8 @@ def adopt_drive(body: Adopt):
         raise HTTPException(400, "not a vaultsync pool")
     drive_id = body.pool[3:]
     with db() as con:
+        if not con.execute("SELECT 1 FROM drives WHERE id=?", (drive_id,)).fetchone():
+            check_name(con, body.label or body.pool)
         con.execute("DELETE FROM deleted_drives WHERE id=?", (drive_id,))
         if con.execute("SELECT 1 FROM drives WHERE id=?", (drive_id,)).fetchone():
             con.execute("UPDATE drives SET retired_at=NULL WHERE id=?", (drive_id,))
@@ -313,7 +339,8 @@ def edit_drive(drive_id: str, body: DriveEdit):
     with db() as con:
         get_drive(con, drive_id)
         if body.label is not None and body.label.strip():
-            con.execute("UPDATE drives SET label=? WHERE id=?", (body.label.strip(), drive_id))
+            label = check_name(con, body.label, exclude_id=drive_id)
+            con.execute("UPDATE drives SET label=? WHERE id=?", (label, drive_id))
         if body.notes is not None:
             con.execute("UPDATE drives SET notes=? WHERE id=?", (body.notes.strip(), drive_id))
         if body.retired is not None:

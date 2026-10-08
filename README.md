@@ -161,6 +161,8 @@ Deleting removes:
 
 The drive has to be unplugged first. Deleting never touches the data on the drive itself.
 
+Drive names must be unique, ignoring capitalization and extra spaces. Retired drives count too: a name can only be reused after the old drive is deleted. The setup, add, and rename windows warn as you type. Drives set up from the shell get the same check on the host.
+
 This is the cleanup to use after reformatting a drive. A reformatted disk gets a new pool id, so it shows up as a new drive, and the old entry can then be retired and deleted. From the shell, `vaultsync forget vs-xxxxxxxx` does the host-side part of the cleanup.
 
 ## If a drive is unplugged mid-backup

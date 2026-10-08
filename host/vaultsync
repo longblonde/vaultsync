@@ -1152,6 +1152,10 @@ def body_init(job, cfg):
     device, serial, label = p["device"], p["serial"], p["label"]
     if not LABEL_RE.match(label or ""):
         raise VSError("label must be 1-40 characters: letters, numbers, space, . _ -")
+    for pool, info in known_drives().items():
+        if (info.get("label") or "").strip().lower() == label.strip().lower():
+            raise VSError(f"a drive named '{info['label']}' already exists ({pool}); pick another name "
+                          f"or 'vaultsync forget {pool}' if that drive is gone")
     disks = {d["device"]: d for d in usb_disks(cfg)}
     d = disks.get(device)
     if not d:
@@ -1571,6 +1575,9 @@ def cmd_init(args, cfg):
     d = disks.get(dev)
     if not d:
         sys.exit(f"{dev} is not an attached USB disk (see 'vaultsync drives')")
+    for pool, info in known_drives().items():
+        if (info.get("label") or "").strip().lower() == args.label.strip().lower():
+            sys.exit(f"a drive named '{info['label']}' already exists ({pool}); pick another name")
     print(f"\nThis will ERASE {dev}: {d['model']} serial {d['serial']} ({human(d['size'])})")
     if d["partitions"]:
         for p in d["partitions"]:
