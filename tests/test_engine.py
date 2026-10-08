@@ -24,6 +24,7 @@ os.environ["FAKEZFS_STATE"] = os.path.join(TMP, "zfs.json")
 os.environ["VAULTSYNC_CONFIG"] = os.path.join(TMP, "config.json")
 os.environ["VAULTSYNC_STATE"] = os.path.join(TMP, "state")
 os.environ["VAULTSYNC_RUN"] = os.path.join(TMP, "run")
+os.environ["VAULTSYNC_STALL_CHECK"] = "2"
 
 loader = importlib.machinery.SourceFileLoader("vaultsync", os.path.join(ROOT, "host", "vaultsync"))
 spec = importlib.util.spec_from_loader("vaultsync", loader)
@@ -160,6 +161,26 @@ def test():
     assert "vaultsync:pending" not in st["ds"][A]["props"]
     check_clean(A, "aaaa1111")
     print("ok  next sync resumes and then catches up")
+
+    bump("tank/piwigo/upload", 300_000)
+    os.environ["FAKEZFS_STALL_RECV"] = f"{A}/data/piwigo/upload"
+    d = sync(A, expect="failed")
+    del os.environ["FAKEZFS_STALL_RECV"]
+    assert "stopped responding" in d["message"], d["message"]
+    assert zstate()["pools"][A]["health"] == "SUSPENDED"
+    try:
+        vs.ensure_imported(A)
+        raise AssertionError("sync onto a suspended pool should be refused")
+    except vs.VSError as e:
+        assert "reconnect" in str(e)
+    vs.reconnect_pool(A)
+    assert zstate()["pools"][A]["health"] == "ONLINE"
+    st = zstate()
+    st["ds"][f"{A}/data/piwigo/upload"]["token"] = None   # the fake doesn't save partial state on a stall
+    zsave(st)
+    d = sync(A)
+    check_clean(A, "aaaa1111")
+    print("ok  unplugged mid-sync: stall detected, reconnect, then resume:", d["result"]["mode"])
 
     d = sync(C, expect="failed")
     assert "needs about" in d["message"], d["message"]

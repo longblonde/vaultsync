@@ -203,7 +203,17 @@ function jobBlock(j) {
   </div>`;
 }
 
+function problemDock(d) {
+  const p = d.problem;
+  if (!d.attached) {
+    return `<div class="dock"><div class="note bad">${esc(d.label)} was unplugged while it was in use, so the server is holding it open (${esc(p.health)}). Plug it back in to reconnect it. Nothing on ${esc(S.source?.name || "the server")} is affected.</div></div>`;
+  }
+  return `<div class="dock"><div class="note bad">${esc(d.label)} was unplugged while it was in use (${esc(p.health)}). Reconnect it before doing anything else; an interrupted backup resumes on the next backup.</div>
+    <div class="dock-actions"><button class="primary" data-act="reconnect" data-id="${d.id}">Reconnect</button></div></div>`;
+}
+
 function dock(d) {
+  if (d.problem) return problemDock(d);
   const a = d.attached;
   const notes = [];
   if (a.port_mode === "slow" || (a.speed && a.speed < 5000)) {
@@ -236,7 +246,7 @@ function driveRow(d) {
   const who = d.custodian
     ? `With <b>${esc(d.custodian)}</b>${d.location ? `, ${esc(d.location)}` : ""}`
     : `<span class="muted">No custodian set</span>`;
-  const cls = ["drive", d.attached ? "attached" : "", d.retired_at ? "retired" : ""].join(" ");
+  const cls = ["drive", d.attached || d.problem ? "attached" : "", d.retired_at ? "retired" : ""].join(" ");
   return `<div class="${cls}">
     <div class="drive-main" data-open="${d.id}" tabindex="0" role="link" aria-label="Open ${esc(d.label)}">
       <div><div class="tag-label">${esc(d.label)}</div><div class="tag-who">${d.retired_at ? "Retired" : who}</div></div>
@@ -244,7 +254,7 @@ function driveRow(d) {
       ${lastResult(d)}
       <div class="cap"><b>${d.capacity ? bytes(d.capacity) : "—"}</b>${d.attached ? "connected" : "not connected"}</div>
     </div>
-    ${d.attached ? dock(d) : ""}
+    ${d.attached || d.problem ? dock(d) : ""}
   </div>`;
 }
 
@@ -631,6 +641,12 @@ document.addEventListener("click", async (e) => {
     if (act === "sync") return syncModal(id);
     if (act === "verify") return confirmModal(`Verify ${d.label}`, `Reads every block on the drive and checks it against its checksums. On a full drive this can take several hours. The drive can't be backed up while it runs.`, "Start verify", async () => { await api("POST", `/api/drives/${id}/verify`); toast(`Verifying ${d.label}`); });
     if (act === "eject") return confirmModal(`Eject ${d.label}`, `Closes the drive so it can be unplugged safely.`, "Eject", async () => { await api("POST", `/api/drives/${id}/eject`); toast(`Ejecting ${d.label}…`); });
+    if (act === "reconnect") {
+      btn.disabled = true; btn.textContent = "Reconnecting…";
+      try { await api("POST", `/api/drives/${id}/reconnect`); toast(`${d.label} reconnected`); }
+      catch (ex) { toast(ex.message); }
+      return poll.now();
+    }
     if (act === "custody") return custodyModal(id);
     if (act === "edit") return editModal(id);
     if (act === "cancel") return confirmModal("Stop this job?", "A stopped backup can be resumed: the next backup to this drive continues where this one stopped.", "Stop job", async () => { await api("POST", `/api/jobs/${job}/cancel`); toast("Stopping…"); }, true);

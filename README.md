@@ -127,6 +127,7 @@ vaultsync verify Alpha         # scrub: read every block and check checksums
 vaultsync eject Alpha
 vaultsync init /dev/sdX --label Charlie   # ERASES the disk
 vaultsync jobs | vaultsync log <job id> | vaultsync cancel <job id>
+vaultsync reconnect            # reattach a drive that was unplugged while in use
 vaultsync cleanup              # remove leftover snapshots from interrupted syncs
 ```
 
@@ -144,6 +145,22 @@ Two drives on the same controller share its bandwidth. For two full-speed backup
 ### Capacity
 
 A drive has to hold the whole source. The dashboard warns when the data reaches 80% of a drive's capacity, and a sync that won't fit is refused before anything is copied. As `tank` grows past about 5.5 TB, the 6 TB drive will stop fitting. Retire it then, via **Edit → Retired**, and use larger drives. To leave a dataset out, add it to `"exclude"` in `/etc/vaultsync/config.json`.
+
+## If a drive is unplugged mid-backup
+
+When the only disk of a ZFS pool disappears, ZFS suspends that pool and anything writing to it waits.
+
+- **Drives created with v0.2 or later** use `failmode=continue`. Older drives are switched to it the next time they're imported. With this setting, writes fail with an error instead of blocking forever.
+- **The sync stops itself.** It watches for a stalled drive: after 45 seconds with no progress it checks the drive. If the drive's pool isn't healthy, the sync stops with "the drive stopped responding".
+- **What the dashboard shows:** the drive row turns red with a **Reconnect** button. From the shell, use `vaultsync reconnect`.
+
+To recover:
+
+1. Plug the drive back in, preferably into the same port.
+2. Choose **Reconnect**, or run `vaultsync reconnect`. This runs `zpool clear` on the drive's pool.
+3. Back up again. The interrupted copy resumes.
+
+If reconnecting keeps failing while the drive is plugged in, the host has to be rebooted to release the pool. This is a ZFS limitation. `tank` is never affected.
 
 ## Restoring from a backup drive
 
@@ -205,6 +222,7 @@ The engine tests cover:
 - removed datasets
 - two drives rotating independently
 - interrupted and resumed syncs
+- a drive unplugged mid-copy (stall detected, reconnect, resume)
 - too-small drives
 - a diverged drive being rebuilt
 - plan

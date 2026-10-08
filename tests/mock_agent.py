@@ -77,6 +77,7 @@ JOBS = [
 JOBS[0]["result"].update(serial="WD-WX11D38NJ8AN", model="WDC WD60EZRZ-00GZ5B1", size=6001175126016)
 JOBS[3]["result"].update(serial="WX52D7123456", model="WD Elements 25A3", size=12000138625024)
 LOGS = {}
+PROBLEMS = []
 
 
 def ports_view():
@@ -201,7 +202,7 @@ class H(BaseHTTPRequestHandler):
                                             {"name": "tank/piwigo/galleries", "used": 213_000, "refer": 213_000, "avail": 0, "excluded": False},
                                             {"name": "tank/piwigo/upload", "used": 35_300_000_000, "refer": 35_300_000_000, "avail": 0, "excluded": False}]},
                     "ports": ports_view(), "disks": disks_view(), "jobs": sorted(JOBS, key=lambda j: j["id"], reverse=True)[:50],
-                    "known": KNOWN, "config": CONFIG})
+                    "known": KNOWN, "config": CONFIG, "problems": PROBLEMS})
             if p == "/api/jobs":
                 return self.send(200, {"jobs": sorted(JOBS, key=lambda j: j["id"], reverse=True)})
             if p.endswith("/log"):
@@ -230,6 +231,13 @@ class H(BaseHTTPRequestHandler):
                                        "reset": False, "bytes": 1_240_000_000 if d["label"] != "Ivy" else 35_800_000_000,
                                        "drive_free": d["size"] - 36 * GB, "drive_size": d["size"], "fits": True, "pending": None,
                                        "datasets": []})
+            if p == "/mock/problem":
+                PROBLEMS[:] = [{"pool": b["pool"], "health": "SUSPENDED", "label": KNOWN.get(b["pool"], {}).get("label"),
+                                "attached": True}] if b.get("on", True) else []
+                return self.send(200, {"ok": True})
+            if p == "/api/reconnect":
+                PROBLEMS[:] = [x for x in PROBLEMS if x["pool"] != b["pool"]]
+                return self.send(200, {"pool": b["pool"], "health": "ONLINE"})
             if p == "/api/cleanup":
                 return self.send(200, {"removed": []})
             if p.endswith("/cancel"):

@@ -260,6 +260,12 @@ def zfs(args):
         hdr = json.loads(line)
         start_got = hdr["got"] if hdr.get("resume") else 0
         need = (hdr["data"] - start_got) // SCALE
+        if os.environ.get("FAKEZFS_STALL_RECV") == tgt:
+            sys.stdin.buffer.read(max(1, need // 2))
+            st["pools"][pool_of(tgt)]["health"] = "SUSPENDED"
+            save(st)
+            import time
+            time.sleep(3600)  # like a process blocked on a suspended pool
         fail = os.environ.get("FAKEZFS_FAIL_RECV") == tgt
         got = 0
         limit = need // 2 if fail else need
@@ -323,7 +329,7 @@ def zpool(args):
                 continue
             used = pool_used(st, name)
             vals = {"name": name, "size": str(p["size"]), "alloc": str(used),
-                    "free": str(p["size"] - used), "health": "ONLINE"}
+                    "free": str(p["size"] - used), "health": p.get("health", "ONLINE")}
             print("\t".join(vals[c] for c in cols))
         return
     if cmd == "import":
@@ -339,6 +345,8 @@ def zpool(args):
         p = st["pools"].get(args[0])
         if not p or not p["imported"]:
             die("no such pool")
+        if p.get("health", "ONLINE") != "ONLINE":
+            die(f"cannot export '{args[0]}': pool I/O is currently suspended")
         p["imported"] = False
         return save(st)
     if cmd == "status":
@@ -358,6 +366,11 @@ def zpool(args):
             props[k] = v
         st["ds"][pool] = {"data": 0, "snaps": [], "bms": [], "props": props, "token": None}
         return save(st)
+    if cmd == "clear":
+        st["pools"][args[0]]["health"] = "ONLINE"
+        return save(st)
+    if cmd == "set":
+        return
     if cmd == "labelclear":
         return
     die(f"fakezfs: unsupported zpool {cmd}")

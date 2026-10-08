@@ -15,6 +15,7 @@ Runs on the ZFS host (e.g. Proxmox). Standard library only.
   vaultsync jobs                list recent jobs
   vaultsync log JOB_ID          show a job log
   vaultsync cancel JOB_ID       stop a running job
+  vaultsync reconnect [POOL]    reattach a drive that was unplugged while in use
   vaultsync cleanup             remove stale vaultsync snapshots from the source
   vaultsync agent               run the HTTP agent used by the dashboard
 
@@ -35,6 +36,7 @@ import json
 import os
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -46,7 +48,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 CONFIG_PATH = os.environ.get("VAULTSYNC_CONFIG", "/etc/vaultsync/config.json")
 STATE_DIR = os.environ.get("VAULTSYNC_STATE", "/var/lib/vaultsync")
 RUN_DIR = os.environ.get("VAULTSYNC_RUN", "/run/vaultsync")
@@ -56,6 +58,8 @@ PLAN_PREFIX = "vaultsync-plan-"
 POOL_RE = re.compile(r"^vs-[0-9a-f]{8}$")
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$")
 CHUNK = 1 << 20
+STALL_CHECK = int(os.environ.get("VAULTSYNC_STALL_CHECK", 45))   # idle seconds before checking the drive
+STALL_LIMIT = int(os.environ.get("VAULTSYNC_STALL_LIMIT", 600))  # idle seconds before giving up anyway
 
 DEFAULT_CONFIG = {
     "source": "tank",
@@ -112,11 +116,41 @@ def hms(sec):
     return f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
 
 
-def run(cmd, check=True, input=None, timeout=None):
-    p = subprocess.run(cmd, input=input, capture_output=True, text=True, timeout=timeout)
+def _abandon(p):
+    """Kill a child that timed out. A process stuck on a suspended ZFS pool can't
+    die until the pool resumes, so never block waiting for it."""
+    try:
+        p.kill()
+    except OSError:
+        pass
+    threading.Thread(target=p.wait, daemon=True).start()
+
+
+def run(cmd, check=True, input=None, timeout=300):
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        if check:
+            raise VSError(f"{cmd[0]} is not installed") from None
+        return ""
+    try:
+        out, err = p.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _abandon(p)
+        raise VSError(f"{' '.join(shlex.quote(c) for c in cmd)} did not finish within {timeout}s "
+                      f"(is a backup drive disconnected? see 'zpool status -x')") from None
     if check and p.returncode != 0:
-        raise VSError(f"{' '.join(shlex.quote(c) for c in cmd)} failed: {(p.stderr or p.stdout).strip()}")
-    return p.stdout
+        raise VSError(f"{' '.join(shlex.quote(c) for c in cmd)} failed: {(err or out).strip()}")
+    return out
+
+
+def run_q(cmd, timeout=15):
+    """Query that must never hang the caller. Returns stdout, or "" on error/timeout."""
+    try:
+        return run(cmd, check=False, timeout=timeout)
+    except VSError:
+        return ""
 
 
 def atomic_write_json(path, data):
@@ -257,7 +291,7 @@ def usb_ports(cfg=None):
 
 
 def imported_pools():
-    out = run(["zpool", "list", "-H", "-p", "-o", "name,size,alloc,free,health"], check=False)
+    out = run_q(["zpool", "list", "-H", "-p", "-o", "name,size,alloc,free,health"])
     pools = {}
     for line in out.splitlines():
         parts = line.split("\t")
@@ -269,7 +303,7 @@ def imported_pools():
 
 def pool_member_disks(pool):
     """Return kernel disk names (sdX) backing an imported pool."""
-    out = run(["zpool", "list", "-v", "-H", "-P", pool], check=False)
+    out = run_q(["zpool", "list", "-v", "-H", "-P", pool])
     disks = set()
     for line in out.splitlines():
         dev = line.strip().split("\t")[0].strip()
@@ -280,9 +314,9 @@ def pool_member_disks(pool):
 
 
 def pool_props(pool):
-    out = run(["zfs", "get", "-H", "-p", "-o", "property,value",
+    out = run_q(["zfs", "get", "-H", "-p", "-o", "property,value",
                "vaultsync:id,vaultsync:label,vaultsync:created,vaultsync:last_sync,"
-               "vaultsync:last_snapshot,vaultsync:pending,vaultsync:last_verify", pool], check=False)
+               "vaultsync:last_snapshot,vaultsync:pending,vaultsync:last_verify", pool])
     props = {}
     for line in out.splitlines():
         k, _, v = line.partition("\t")
@@ -407,23 +441,58 @@ def find_drive(arg=None, cfg=None):
     raise VSError(f"no attached vaultsync drive matches '{arg}'")
 
 
+def pool_health(pool):
+    """ONLINE, DEGRADED, SUSPENDED, UNAVAIL, ... or None if it can't be read in time."""
+    out = run_q(["zpool", "list", "-H", "-o", "health", pool], timeout=10).strip()
+    return out or None
+
+
 def ensure_imported(pool):
     """Import a drive pool without mounting. Returns True if we imported it."""
-    if pool in imported_pools():
+    pools = imported_pools()
+    if pool in pools:
+        if pools[pool]["health"] not in ("ONLINE", "DEGRADED"):
+            raise VSError(f"{pool} is {pools[pool]['health']}: the drive was disconnected while in use. "
+                          f"Plug it back in and reconnect it (dashboard, or 'vaultsync reconnect').")
         return False
-    run(["zpool", "import", "-N", "-o", "cachefile=none", pool], timeout=300)
+    run(["zpool", "import", "-N", "-o", "cachefile=none", "-o", "failmode=continue", pool], timeout=300)
+    # failmode=continue: if the disk vanishes, writes fail with an error instead of
+    # blocking forever (drives created before v0.2 had the default, failmode=wait)
+    run_q(["zpool", "set", "failmode=continue", pool])
     return True
 
 
 def export_pool(pool, log=None):
     for attempt in range(3):
-        p = subprocess.run(["zpool", "export", pool], capture_output=True, text=True)
-        if p.returncode == 0:
+        try:
+            run(["zpool", "export", pool], timeout=60)
             return True
-        if log:
-            log(f"export attempt {attempt + 1} failed: {p.stderr.strip()}")
+        except VSError as e:
+            if log:
+                log(f"export attempt {attempt + 1} failed: {e}")
+            if "did not finish" in str(e):
+                return False
         time.sleep(3)
     return False
+
+
+def reconnect_pool(pool):
+    """After a drive was unplugged mid-use and plugged back in: reopen its disk."""
+    if not POOL_RE.match(pool):
+        raise VSError("bad pool name")
+    if pool not in imported_pools():
+        raise VSError(f"{pool} is not imported, nothing to reconnect")
+    run(["udevadm", "settle"], check=False, timeout=30)
+    try:
+        run(["zpool", "clear", pool], timeout=60)
+    except VSError as e:
+        raise VSError(f"could not reconnect {pool}: {e}. If the drive is plugged in and this keeps "
+                      f"failing, the host has to be rebooted to release it.") from None
+    health = pool_health(pool)
+    if health != "ONLINE":
+        raise VSError(f"{pool} is still {health or 'not responding'} after reconnecting")
+    _state_cache["t"] = 0
+    return {"pool": pool, "health": health}
 
 
 def source_info(cfg=None):
@@ -734,6 +803,8 @@ class Syncer:
         return steps, need_full_reset
 
     def transfer(self, send_cmd, recv_cmd, done_before, total, label):
+        """Pipe zfs send into zfs recv, reporting progress. Watches for a stalled
+        drive (unplugged mid-copy) instead of blocking forever."""
         self.job.log(f"  {label}: {' '.join(send_cmd)}", echo=False)
         send = subprocess.Popen(send_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         recv = subprocess.Popen(recv_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -747,46 +818,84 @@ class Syncer:
                    threading.Thread(target=drain, args=("recv", recv.stderr), daemon=True)]
         for t in threads:
             t.start()
-        done = 0
-        t0 = time.time()
+        rfd, wfd = send.stdout.fileno(), recv.stdin.fileno()
+        os.set_blocking(wfd, False)
+        done, buf, eof = 0, b"", False
+        t0 = last_progress = time.time()
         window = []  # (time, bytes) for a rolling rate
-        fd = send.stdout.fileno()
+        stalled = None
         try:
-            while True:
+            while not (eof and not buf):
                 if self.job.cancelled:
                     raise VSError("cancelled")
-                chunk = os.read(fd, CHUNK)
-                if not chunk:
-                    break
-                recv.stdin.write(chunk)
-                done += len(chunk)
+                if recv.poll() is not None:
+                    break  # receiver exited early; its stderr says why
+                rl, wl, _ = select.select([rfd] if not buf and not eof else [], [wfd] if buf else [], [], min(5, STALL_CHECK))
                 now = time.time()
-                window.append((now, done))
-                while len(window) > 2 and now - window[0][0] > 20:
-                    window.pop(0)
-                span = now - window[0][0]
-                rate = (done - window[0][1]) / span if span > 1 else done / max(now - t0, 0.001)
-                self.job.progress(done_before + done, max(total, done_before + done), rate)
+                if rl:
+                    chunk = os.read(rfd, CHUNK)
+                    if chunk:
+                        buf = chunk
+                    else:
+                        eof = True
+                if wl and buf:
+                    try:
+                        n = os.write(wfd, buf)
+                    except BlockingIOError:
+                        n = 0
+                    if n:
+                        buf = buf[n:]
+                        done += n
+                        last_progress = now
+                        window.append((now, done))
+                        while len(window) > 2 and now - window[0][0] > 20:
+                            window.pop(0)
+                        span = now - window[0][0]
+                        rate = (done - window[0][1]) / span if span > 1 else done / max(now - t0, 0.001)
+                        self.job.progress(done_before + done, max(total, done_before + done), rate)
+                idle = now - last_progress
+                if idle >= STALL_CHECK and now - getattr(self, "_last_check", 0) >= STALL_CHECK:
+                    self._last_check = now
+                    health = pool_health(self.pool)
+                    self.job.log(f"no progress for {int(idle)}s; drive pool is {health or 'not responding'}")
+                    if health not in ("ONLINE", "DEGRADED"):
+                        stalled = (f"the drive stopped responding ({self.pool} is {health or 'not responding'}). "
+                                   f"It was probably unplugged. Plug it back in and choose Reconnect, "
+                                   f"then back up again to resume.")
+                        break
+                    if idle >= STALL_LIMIT:
+                        stalled = f"no data moved for {int(idle)}s; giving up so it can be retried"
+                        break
         except BrokenPipeError:
             pass
         finally:
             try:
+                os.set_blocking(wfd, True)
                 recv.stdin.close()
-            except BrokenPipeError:
+            except (BrokenPipeError, OSError):
                 pass
-            if self.job.cancelled:
+            if self.job.cancelled or stalled:
                 for p in (send, recv):
                     if p.poll() is None:
-                        p.terminate()
-            recv.wait()
-            if send.poll() is None and recv.returncode != 0:
-                # receiver died; stop the sender so it doesn't block on a full pipe
-                send.terminate()
-            send.stdout.close()
-            send.wait()
+                        p.kill()
+            # never block on a child stuck on a suspended pool
+            for p in (recv, send):
+                try:
+                    p.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    _abandon(p)
+                    self.job.log(f"  pid {p.pid} is stuck in the kernel; leaving it behind")
+                if p is recv and send.poll() is None and recv.returncode not in (0, None):
+                    send.kill()
+            try:
+                send.stdout.close()
+            except OSError:
+                pass
             for t in threads:
                 t.join(timeout=5)
             self.job.procs = []
+        if stalled:
+            raise VSError(stalled)
         if send.returncode != 0 or recv.returncode != 0:
             msg = (errs["recv"] or errs["send"]).decode(errors="replace").strip()
             raise VSError(f"{label} failed: {msg or 'send/receive error'}")
@@ -994,6 +1103,10 @@ def scrub(job, pool):
         if job.cancelled:
             run(["zpool", "scrub", "-s", pool], check=False)
             raise VSError("cancelled")
+        health = pool_health(pool)
+        if health not in ("ONLINE", "DEGRADED"):
+            raise VSError(f"the drive stopped responding during verify ({pool} is {health or 'not responding'}); "
+                          f"plug it back in and reconnect it")
         st = run(["zpool", "status", pool], check=False)
         if "scrub in progress" not in st:
             break
@@ -1065,7 +1178,7 @@ def body_init(job, cfg):
             run(["sgdisk", "--zap-all", device], check=False)
         run(["udevadm", "settle"], check=False)
         job.phase("creating", f"creating pool {pool}")
-        run(["zpool", "create", "-f", "-o", "ashift=12", "-o", "cachefile=none",
+        run(["zpool", "create", "-f", "-o", "ashift=12", "-o", "cachefile=none", "-o", "failmode=continue",
              "-O", "compression=lz4", "-O", "atime=off", "-O", "xattr=sa",
              "-O", "canmount=off", "-O", "readonly=on",
              "-O", f"mountpoint=/mnt/vaultsync/{drive_id}",
@@ -1089,6 +1202,8 @@ def body_eject(job, cfg):
     if not disk:
         raise VSError(f"{pool} is not attached")
     with Lock(pool):
+        if disk["imported"] and disk.get("health") not in (None, "ONLINE", "DEGRADED"):
+            raise VSError(f"{pool} is {disk['health']}; reconnect it before ejecting")
         if disk["imported"]:
             job.phase("exporting", f"exporting {pool}")
             if not export_pool(pool, job.log):
@@ -1257,6 +1372,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                 if not POOL_RE.match(pool):
                     raise VSError("bad pool name")
                 return self._send(200, plan_drive(pool, cfg))
+            if method == "POST" and path == "/api/reconnect":
+                return self._send(200, reconnect_pool(self._body().get("pool", "")))
             if method == "POST" and path == "/api/cleanup":
                 return self._send(200, {"removed": cleanup_stale(cfg, log=lambda *_: None)})
             if method == "PUT" and path == "/api/config":
@@ -1281,7 +1398,13 @@ def state(cfg):
         disks = usb_disks(cfg)
         for d in disks:
             d["busy"] = d["pool"] in busy
+        known = known_drives()
+        problems = [{"pool": name, "health": p["health"], "label": known.get(name, {}).get("label"),
+                     "attached": any(d["pool"] == name for d in disks)}
+                    for name, p in imported_pools().items()
+                    if POOL_RE.match(name) and p["health"] not in ("ONLINE", "DEGRADED")]
         data = {
+            "problems": problems,
             "host": socket.gethostname(), "version": VERSION, "time": now_iso(),
             "source": source_info(cfg), "ports": usb_ports(cfg), "disks": disks,
             "jobs": jobs, "known": known_drives(),
@@ -1330,6 +1453,15 @@ def cancel_job(jid):
         raise VSError("job is not running")
     if pid and pid_alive(pid):
         os.kill(int(pid), signal.SIGTERM)
+
+        def escalate():
+            time.sleep(20)
+            if pid_alive(pid):
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except OSError:
+                    pass
+        threading.Thread(target=escalate, daemon=True).start()
     _state_cache["t"] = 0
     return {"ok": True}
 
@@ -1493,6 +1625,25 @@ def cmd_cancel(args, cfg):
     print(cancel_job(args.job))
 
 
+def cmd_reconnect(args, cfg):
+    pools = [args.drive] if args.drive else [
+        n for n, p in imported_pools().items() if POOL_RE.match(n) and p["health"] not in ("ONLINE", "DEGRADED")]
+    if args.drive and not POOL_RE.match(args.drive):
+        pools = [find_drive(args.drive, cfg)["pool"]]
+    if not pools:
+        print("no disconnected backup drives")
+        return 0
+    rc = 0
+    for pool in pools:
+        try:
+            reconnect_pool(pool)
+            print(f"{pool} reconnected; run 'vaultsync sync' to resume, or 'vaultsync eject'")
+        except VSError as e:
+            print(f"error: {e}", file=sys.stderr)
+            rc = 1
+    return rc
+
+
 def cmd_cleanup(args, cfg):
     removed = cleanup_stale(cfg)
     print(f"removed {len(removed)} snapshot(s)")
@@ -1529,6 +1680,9 @@ def main(argv=None):
     p.add_argument("job")
     p.set_defaults(fn=cmd_cancel)
     sub.add_parser("cleanup").set_defaults(fn=cmd_cleanup)
+    p = sub.add_parser("reconnect", help="reattach a drive that was unplugged while in use")
+    p.add_argument("drive", nargs="?")
+    p.set_defaults(fn=cmd_reconnect)
     p = sub.add_parser("agent")
     p.add_argument("--listen")
     p.add_argument("--port", type=int)

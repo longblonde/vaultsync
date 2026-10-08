@@ -201,9 +201,11 @@ def get_state():
         drives = drive_rows(con)
     by_pool = {d["pool"]: d for d in drives}
     active = [j for j in a.get("jobs", []) if j.get("status") in ("running", "queued")]
+    problems = {p["pool"]: p for p in a.get("problems", [])}
     for d in drives:
         d["attached"] = None
         d["active_job"] = next((j for j in active if j.get("pool") == d["pool"]), None)
+        d["problem"] = problems.get(d["pool"])
     unknown = []
     for disk in a.get("disks", []):
         if disk.get("vaultsync") and disk["pool"] in by_pool:
@@ -341,6 +343,11 @@ def _pool(drive_id):
 @app.post("/api/drives/{drive_id}/plan")
 def plan(drive_id: str):
     return call("POST", "/api/plan", {"pool": _pool(drive_id)}, timeout=120)
+
+
+@app.post("/api/drives/{drive_id}/reconnect")
+def reconnect(drive_id: str):
+    return call("POST", "/api/reconnect", {"pool": _pool(drive_id)}, timeout=120)
 
 
 @app.post("/api/drives/{drive_id}/{action}")
