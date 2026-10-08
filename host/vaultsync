@@ -1,0 +1,1553 @@
+#!/usr/bin/env python3
+"""
+vaultsync — rotating ZFS backups to removable USB drives.
+
+Runs on the ZFS host (e.g. Proxmox). Standard library only.
+
+  vaultsync status              overview: source pool, ports, attached drives, jobs
+  vaultsync ports               list physical USB ports and what is plugged in
+  vaultsync drives              list attached USB disks
+  vaultsync init /dev/sdX --label NAME     ERASE a disk and make it a backup drive
+  vaultsync plan  [POOL|LABEL]  show what a sync would do (full/incremental, size)
+  vaultsync sync  [POOL|LABEL]  back up the source pool to the drive, prints COMPLETE
+  vaultsync verify [POOL|LABEL] scrub the backup drive and report errors
+  vaultsync eject [POOL|LABEL]  export the drive pool and detach the disk
+  vaultsync jobs                list recent jobs
+  vaultsync log JOB_ID          show a job log
+  vaultsync cancel JOB_ID       stop a running job
+  vaultsync cleanup             remove stale vaultsync snapshots from the source
+  vaultsync agent               run the HTTP agent used by the dashboard
+
+How it works
+  * Each backup drive is a single-disk ZFS pool named vs-<id>.
+  * Each sync snapshots the source recursively and sends every dataset to
+    <pool>/data/... . After success the source keeps only a ZFS *bookmark*
+    per dataset per drive, so a drive that is away for months pins no space.
+  * Receives are resumable (zfs recv -s): an interrupted sync continues where
+    it stopped the next time that drive is synced.
+  * The drive keeps only the most recent snapshot.
+"""
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+VERSION = "0.1.0"
+CONFIG_PATH = os.environ.get("VAULTSYNC_CONFIG", "/etc/vaultsync/config.json")
+STATE_DIR = os.environ.get("VAULTSYNC_STATE", "/var/lib/vaultsync")
+RUN_DIR = os.environ.get("VAULTSYNC_RUN", "/run/vaultsync")
+POOL_PREFIX = "vs-"
+SNAP_PREFIX = "vaultsync-"
+PLAN_PREFIX = "vaultsync-plan-"
+POOL_RE = re.compile(r"^vs-[0-9a-f]{8}$")
+LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$")
+CHUNK = 1 << 20
+
+DEFAULT_CONFIG = {
+    "source": "tank",
+    "exclude": [],
+    "listen": "0.0.0.0",
+    "port": 8710,
+    "token": "",
+    "allowed_clients": [],
+    "max_jobs": 2,
+    "verify_after_sync": False,
+    "pre_snapshot_hook": "",
+    "stale_snapshot_days": 14,
+    "ports": {},
+}
+
+# ---------------------------------------------------------------- utilities
+
+
+class VSError(Exception):
+    pass
+
+
+def now_iso():
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def stamp():
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def stamp_age_days(name):
+    m = re.search(r"(\d{8}T\d{6}Z)$", name)
+    if not m:
+        return None
+    t = dt.datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+    return (dt.datetime.now(dt.timezone.utc) - t).total_seconds() / 86400
+
+
+def human(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(n) < 1000 or unit == "PB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} PB"
+
+
+def hms(sec):
+    if sec is None:
+        return "--"
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
+
+
+def run(cmd, check=True, input=None, timeout=None):
+    p = subprocess.run(cmd, input=input, capture_output=True, text=True, timeout=timeout)
+    if check and p.returncode != 0:
+        raise VSError(f"{' '.join(shlex.quote(c) for c in cmd)} failed: {(p.stderr or p.stdout).strip()}")
+    return p.stdout
+
+
+def atomic_write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def _read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True
+
+
+# ---------------------------------------------------------------- config
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(read_json(CONFIG_PATH, {}) or {})
+    return cfg
+
+
+def save_config(cfg):
+    atomic_write_json(CONFIG_PATH, cfg)
+    os.chmod(CONFIG_PATH, 0o600)
+
+
+# ------------------------------------------------------- known drive labels
+# Host-side cache of pool -> label so the CLI can resolve labels and the
+# dashboard can show a name for drives it has not registered.
+
+
+def known_path():
+    return os.path.join(STATE_DIR, "known_drives.json")
+
+
+def remember_drive(pool, **fields):
+    data = read_json(known_path(), {}) or {}
+    entry = data.get(pool, {})
+    entry.update({k: v for k, v in fields.items() if v is not None})
+    data[pool] = entry
+    atomic_write_json(known_path(), data)
+
+
+def known_drives():
+    return read_json(known_path(), {}) or {}
+
+
+# ---------------------------------------------------------------- USB ports
+
+SYS_USB = "/sys/bus/usb/devices"
+DEV_RE = re.compile(r"^\d+-[\d.]+$")
+
+
+def _is_hub(devdir):
+    return _read(os.path.join(devdir, "bDeviceClass")) == "09"
+
+
+def _walk(devdir, busnum, chain, pci, bus_speed, ports, depth=0):
+    try:
+        maxchild = int(_read(os.path.join(devdir, "maxchild"), "0") or 0)
+    except ValueError:
+        maxchild = 0
+    for i in range(1, maxchild + 1):
+        sub = f"{chain}.{i}" if chain else str(i)
+        child = os.path.join(SYS_USB, f"{busnum}-{sub}")
+        exists = os.path.isdir(child)
+        if exists and _is_hub(child) and depth < 4:
+            _walk(child, busnum, sub, pci, bus_speed, ports, depth + 1)
+            continue
+        key = f"{pci}:{sub}"
+        p = ports.setdefault(key, {"key": key, "controller": pci, "chain": sub,
+                                   "max_speed": 0, "buses": [], "device": None})
+        p["max_speed"] = max(p["max_speed"], bus_speed)
+        p["buses"].append(int(busnum))
+        if exists:
+            p["device"] = {
+                "usb_id": f"{busnum}-{sub}",
+                "product": _read(os.path.join(child, "product")),
+                "manufacturer": _read(os.path.join(child, "manufacturer")),
+                "speed": int(float(_read(os.path.join(child, "speed"), "0") or 0)),
+                "storage": any(
+                    _read(os.path.join(child, iface, "bInterfaceClass")) == "08"
+                    for iface in os.listdir(child) if iface.startswith(f"{busnum}-{sub}:")
+                ),
+            }
+
+
+def usb_ports(cfg=None):
+    cfg = cfg or load_config()
+    ports = {}
+    if os.path.isdir(SYS_USB):
+        for name in sorted(os.listdir(SYS_USB)):
+            if not re.fullmatch(r"usb\d+", name):
+                continue
+            root = os.path.realpath(os.path.join(SYS_USB, name))
+            pci = os.path.basename(os.path.dirname(root))
+            speed = int(float(_read(os.path.join(root, "speed"), "0") or 0))
+            _walk(root, name[3:], "", pci, speed, ports)
+    conf = cfg.get("ports", {})
+    out = []
+    for key in sorted(ports):
+        p = ports[key]
+        c = conf.get(key, {})
+        p["name"] = c.get("name", "")
+        p["mode"] = c.get("mode", "unconfigured")
+        p["buses"] = sorted(set(p["buses"]))
+        out.append(p)
+    return out
+
+
+# ---------------------------------------------------------------- disks and pools
+
+
+def imported_pools():
+    out = run(["zpool", "list", "-H", "-p", "-o", "name,size,alloc,free,health"], check=False)
+    pools = {}
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 5:
+            pools[parts[0]] = {"size": int(parts[1]), "alloc": int(parts[2]),
+                               "free": int(parts[3]), "health": parts[4]}
+    return pools
+
+
+def pool_member_disks(pool):
+    """Return kernel disk names (sdX) backing an imported pool."""
+    out = run(["zpool", "list", "-v", "-H", "-P", pool], check=False)
+    disks = set()
+    for line in out.splitlines():
+        dev = line.strip().split("\t")[0].strip()
+        if dev.startswith("/dev/"):
+            real = os.path.basename(os.path.realpath(dev))
+            disks.add(re.sub(r"\d+$", "", real) if not real.startswith("nvme") else real)
+    return disks
+
+
+def pool_props(pool):
+    out = run(["zfs", "get", "-H", "-p", "-o", "property,value",
+               "vaultsync:id,vaultsync:label,vaultsync:created,vaultsync:last_sync,"
+               "vaultsync:last_snapshot,vaultsync:pending,vaultsync:last_verify", pool], check=False)
+    props = {}
+    for line in out.splitlines():
+        k, _, v = line.partition("\t")
+        if v and v != "-":
+            props[k.split(":", 1)[1]] = v
+    return props
+
+
+def set_pool_props(pool, **props):
+    args = [f"vaultsync:{k}={v}" for k, v in props.items() if v is not None]
+    if args:
+        run(["zfs", "set", *args, pool])
+    for k, v in props.items():
+        if v is None:
+            run(["zfs", "inherit", f"vaultsync:{k}", pool], check=False)
+
+
+def _by_id(name):
+    best = None
+    d = "/dev/disk/by-id"
+    if not os.path.isdir(d):
+        return None
+    for link in sorted(os.listdir(d)):
+        if "-part" in link:
+            continue
+        if os.path.basename(os.path.realpath(os.path.join(d, link))) == name:
+            rank = 0 if link.startswith("usb-") else 1 if link.startswith("wwn-") else 2
+            if best is None or rank < best[0]:
+                best = (rank, os.path.join(d, link))
+    return best[1] if best else None
+
+
+def usb_disks(cfg=None):
+    cfg = cfg or load_config()
+    data = json.loads(run(["lsblk", "-J", "-b", "-o",
+                           "NAME,SIZE,MODEL,SERIAL,TRAN,TYPE,FSTYPE,LABEL,MOUNTPOINT"]) or "{}")
+    imported = imported_pools()
+    members = {}
+    for pool in imported:
+        for d in pool_member_disks(pool):
+            members[d] = pool
+    portconf = cfg.get("ports", {})
+    known = known_drives()
+    disks = []
+    for dev in data.get("blockdevices", []):
+        if dev.get("type") != "disk" or (dev.get("tran") or "") != "usb":
+            continue
+        name = dev["name"]
+        sysdev = os.path.realpath(f"/sys/block/{name}/device")
+        segs = sysdev.split("/")
+        usb_segs = [s for s in segs if DEV_RE.match(s)]
+        port_key, speed, usb_id = None, 0, None
+        if usb_segs:
+            usb_id = usb_segs[-1]
+            root_idx = next((i for i, s in enumerate(segs) if re.fullmatch(r"usb\d+", s)), None)
+            pci = segs[root_idx - 1] if root_idx else "unknown"
+            port_key = f"{pci}:{usb_id.split('-', 1)[1]}"
+            speed = int(float(_read(os.path.join(SYS_USB, usb_id, "speed"), "0") or 0))
+        children = dev.get("children") or []
+        mounted = [c.get("mountpoint") for c in children if c.get("mountpoint")]
+        if dev.get("mountpoint"):
+            mounted.append(dev["mountpoint"])
+        pool = members.get(name)
+        if not pool:
+            for c in children + [dev]:
+                if c.get("fstype") == "zfs_member" and c.get("label"):
+                    pool = c["label"]
+                    break
+        foreign_zfs = bool(pool and not POOL_RE.match(pool))
+        is_vs = bool(pool and POOL_RE.match(pool))
+        entry = {
+            "device": f"/dev/{name}",
+            "name": name,
+            "by_id": _by_id(name),
+            "model": (dev.get("model") or "").strip(),
+            "serial": (dev.get("serial") or "").strip(),
+            "size": int(dev.get("size") or 0),
+            "port": port_key,
+            "port_name": portconf.get(port_key, {}).get("name", "") if port_key else "",
+            "port_mode": portconf.get(port_key, {}).get("mode", "unconfigured") if port_key else "unknown",
+            "usb_id": usb_id,
+            "speed": speed,
+            "mounted": mounted,
+            "partitions": [{"name": c["name"], "size": int(c.get("size") or 0),
+                            "fstype": c.get("fstype"), "label": c.get("label")} for c in children],
+            "pool": pool,
+            "vaultsync": is_vs,
+            "foreign_zfs": foreign_zfs,
+            "imported": bool(pool and pool in imported),
+            "drive_id": pool[len(POOL_PREFIX):] if is_vs else None,
+            "label": known.get(pool, {}).get("label") if is_vs else None,
+        }
+        if entry["imported"] and is_vs:
+            props = pool_props(pool)
+            entry["props"] = props
+            entry["label"] = props.get("label", entry["label"])
+            entry["pool_size"] = imported[pool]["size"]
+            entry["pool_free"] = imported[pool]["free"]
+            entry["health"] = imported[pool]["health"]
+        disks.append(entry)
+    return disks
+
+
+def find_drive(arg=None, cfg=None):
+    """Resolve POOL / label / serial / /dev/sdX to an attached vaultsync disk."""
+    disks = [d for d in usb_disks(cfg) if d["vaultsync"]]
+    if not arg:
+        if len(disks) == 1:
+            return disks[0]
+        if not disks:
+            raise VSError("no vaultsync drive is attached")
+        raise VSError("several vaultsync drives attached; name one: "
+                      + ", ".join(f"{d['pool']} ({d['label'] or '?'})" for d in disks))
+    for d in disks:
+        if arg in (d["pool"], d["serial"], d["device"], d["name"]) or \
+                (d["label"] and d["label"].lower() == arg.lower()):
+            return d
+    known = known_drives()
+    for pool, info in known.items():
+        if info.get("label", "").lower() == arg.lower():
+            raise VSError(f"drive '{arg}' ({pool}) is not attached")
+    raise VSError(f"no attached vaultsync drive matches '{arg}'")
+
+
+def ensure_imported(pool):
+    """Import a drive pool without mounting. Returns True if we imported it."""
+    if pool in imported_pools():
+        return False
+    run(["zpool", "import", "-N", "-o", "cachefile=none", pool], timeout=300)
+    return True
+
+
+def export_pool(pool, log=None):
+    for attempt in range(3):
+        p = subprocess.run(["zpool", "export", pool], capture_output=True, text=True)
+        if p.returncode == 0:
+            return True
+        if log:
+            log(f"export attempt {attempt + 1} failed: {p.stderr.strip()}")
+        time.sleep(3)
+    return False
+
+
+def source_info(cfg=None):
+    cfg = cfg or load_config()
+    src = cfg["source"]
+    pools = imported_pools()
+    pool_name = src.split("/")[0]
+    out = run(["zfs", "list", "-H", "-p", "-o", "name,used,avail,refer", "-r",
+               "-t", "filesystem,volume", src], check=False)
+    datasets = []
+    for line in out.splitlines():
+        n, used, avail, refer = line.split("\t")
+        datasets.append({"name": n, "used": int(used), "avail": int(avail), "refer": int(refer),
+                         "excluded": _excluded(n, cfg)})
+    root = datasets[0] if datasets else {"used": 0, "avail": 0}
+    return {
+        "name": src,
+        "pool": pools.get(pool_name),
+        "used": root["used"],
+        "avail": root["avail"],
+        "datasets": datasets,
+        "backup_bytes": sum(d["refer"] for d in datasets if not d["excluded"]),
+    }
+
+
+def _excluded(name, cfg):
+    for ex in cfg.get("exclude", []):
+        if name == ex or name.startswith(ex + "/"):
+            return True
+    return False
+
+
+def source_datasets(cfg):
+    out = run(["zfs", "list", "-H", "-o", "name", "-t", "filesystem,volume", "-r", cfg["source"]])
+    names = [n for n in out.splitlines() if n and not _excluded(n, cfg)]
+    if not names or names[0] != cfg["source"]:
+        raise VSError(f"source {cfg['source']} not found")
+    return names
+
+
+# ---------------------------------------------------------------- jobs
+
+
+def jobs_dir():
+    return os.path.join(STATE_DIR, "jobs")
+
+
+def logs_dir():
+    return os.path.join(STATE_DIR, "logs")
+
+
+class Job:
+    TERMINAL = ("success", "failed", "cancelled")
+
+    def __init__(self, data, echo=False):
+        self.data = data
+        self.echo = echo
+        self._last_write = 0
+        self._last_echo = 0
+        self.cancelled = False
+        self.procs = []
+
+    @property
+    def id(self):
+        return self.data["id"]
+
+    @property
+    def path(self):
+        return os.path.join(jobs_dir(), f"{self.id}.json")
+
+    @property
+    def log_path(self):
+        return os.path.join(logs_dir(), f"{self.id}.log")
+
+    @classmethod
+    def create(cls, kind, params, echo=False, origin="cli"):
+        jid = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
+        job = cls({
+            "id": jid, "kind": kind, "params": params, "status": "queued", "phase": "queued",
+            "origin": origin, "host": socket.gethostname(),
+            "pool": params.get("pool"), "label": params.get("label"),
+            "created": now_iso(), "started": None, "finished": None,
+            "bytes_total": 0, "bytes_done": 0, "rate": 0, "eta": None, "percent": None,
+            "message": "", "result": {}, "pid": None,
+        }, echo=echo)
+        job.save(force=True)
+        return job
+
+    @classmethod
+    def load(cls, jid, echo=False):
+        data = read_json(os.path.join(jobs_dir(), f"{jid}.json"))
+        if not data:
+            raise VSError(f"job {jid} not found")
+        return cls(data, echo=echo)
+
+    def save(self, force=False):
+        t = time.time()
+        if force or t - self._last_write >= 1.0:
+            atomic_write_json(self.path, self.data)
+            self._last_write = t
+
+    def update(self, force=False, **kw):
+        self.data.update(kw)
+        self.save(force=force)
+
+    def log(self, msg, echo=True):
+        line = f"{dt.datetime.now().strftime('%H:%M:%S')} {msg}"
+        os.makedirs(logs_dir(), exist_ok=True)
+        with open(self.log_path, "a") as f:
+            f.write(line + "\n")
+        if self.echo and echo:
+            sys.stdout.write("\r\033[K" if sys.stdout.isatty() else "")
+            print(line, flush=True)
+
+    def phase(self, phase, msg=None):
+        self.update(force=True, phase=phase)
+        self.log(msg or phase)
+
+    def progress(self, done, total, rate, ds=None):
+        eta = (total - done) / rate if rate > 0 and total > done else None
+        pct = round(min(100.0, 100.0 * done / total), 1) if total else None
+        self.update(bytes_done=done, bytes_total=total, rate=int(rate), eta=eta, percent=pct)
+        if self.echo:
+            t = time.time()
+            tty = sys.stdout.isatty()
+            if tty and t - self._last_echo >= 0.5:
+                bar_w = 28
+                filled = int(bar_w * (pct or 0) / 100)
+                sys.stdout.write(f"\r\033[K  [{'#' * filled}{'.' * (bar_w - filled)}] "
+                                 f"{pct or 0:5.1f}%  {human(done)} / {human(total)}  "
+                                 f"{human(rate)}/s  ETA {hms(eta)}")
+                sys.stdout.flush()
+                self._last_echo = t
+            elif not tty and t - self._last_echo >= 30:
+                print(f"  {pct or 0:5.1f}%  {human(done)} / {human(total)}  ETA {hms(eta)}", flush=True)
+                self._last_echo = t
+
+    def finish(self, status, message=""):
+        self.update(force=True, status=status, finished=now_iso(), message=message,
+                    phase="done" if status == "success" else status, eta=None)
+        self.log(f"{status.upper()}: {message}" if message else status.upper())
+
+
+def list_jobs(limit=None):
+    out = []
+    d = jobs_dir()
+    if os.path.isdir(d):
+        for fn in sorted(os.listdir(d), reverse=True):
+            if not fn.endswith(".json"):
+                continue
+            data = read_json(os.path.join(d, fn))
+            if not data:
+                continue
+            if data.get("status") in ("running", "queued"):
+                age = time.time() - os.path.getmtime(os.path.join(d, fn))
+                if data.get("pid") and not pid_alive(data["pid"]):
+                    data["status"] = "failed"
+                    data["message"] = data.get("message") or "job process ended unexpectedly"
+                    data["finished"] = data.get("finished") or now_iso()
+                    atomic_write_json(os.path.join(d, fn), data)
+                elif not data.get("pid") and age > 120:
+                    data["status"] = "failed"
+                    data["message"] = "job never started"
+                    data["finished"] = now_iso()
+                    atomic_write_json(os.path.join(d, fn), data)
+            out.append(data)
+            if limit and len(out) >= limit:
+                break
+    return out
+
+
+def active_jobs():
+    return [j for j in list_jobs(limit=200) if j.get("status") in ("running", "queued")]
+
+
+class Lock:
+    def __init__(self, name):
+        os.makedirs(RUN_DIR, exist_ok=True)
+        self.path = os.path.join(RUN_DIR, f"{name}.lock")
+        self.fd = None
+
+    def acquire(self):
+        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(self.fd)
+            self.fd = None
+            return False
+        return True
+
+    def release(self):
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            self.fd = None
+
+    def __enter__(self):
+        if not self.acquire():
+            raise VSError("another job is already using this drive")
+        return self
+
+    def __exit__(self, *a):
+        self.release()
+
+
+def check_capacity(cfg, exclude_job=None, pool=None):
+    act = [j for j in active_jobs() if j["id"] != exclude_job]
+    if pool and any(j.get("pool") == pool for j in act):
+        raise VSError(f"a job is already running for {pool}")
+    if len(act) >= int(cfg.get("max_jobs", 2)):
+        raise VSError(f"{len(act)} job(s) already running (limit {cfg.get('max_jobs', 2)})")
+
+
+# ---------------------------------------------------------------- ZFS helpers
+
+
+def ds_exists(name):
+    return subprocess.run(["zfs", "list", "-H", "-o", "name", name],
+                          capture_output=True).returncode == 0
+
+
+def snap_list(ds, prefix, types="snapshot"):
+    out = run(["zfs", "list", "-H", "-p", "-t", types, "-o", "name,guid,createtxg",
+               "-s", "createtxg", "-d", "1", ds], check=False)
+    res = []
+    for line in out.splitlines():
+        name, guid, txg = line.split("\t")
+        short = re.split(r"[@#]", name, 1)[1]
+        if short.startswith(prefix):
+            res.append({"name": name, "short": short, "guid": guid, "txg": int(txg)})
+    return res
+
+
+def resume_token(ds):
+    if not ds_exists(ds):
+        return None
+    v = run(["zfs", "get", "-H", "-o", "value", "receive_resume_token", ds], check=False).strip()
+    return v if v and v != "-" else None
+
+
+def send_estimate(args):
+    out = run(["zfs", "send", "-n", "-P", *args], check=False)
+    for line in out.splitlines():
+        m = re.match(r"^size\s+(\d+)", line)
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+# ---------------------------------------------------------------- the sync engine
+
+
+class Syncer:
+    def __init__(self, job, cfg, pool):
+        self.job = job
+        self.cfg = cfg
+        self.pool = pool
+        self.src = cfg["source"]
+        self.target_root = f"{pool}/data"
+        self.drive_id = pool[len(POOL_PREFIX):]
+        self.prefix = f"{SNAP_PREFIX}{self.drive_id}-"
+
+    def tgt(self, ds):
+        return self.target_root + ds[len(self.src):]
+
+    def base_for(self, ds, tgt):
+        """Find a source bookmark/snapshot matching the newest drive snapshot."""
+        if not ds_exists(tgt):
+            return None, None
+        tsnaps = snap_list(tgt, self.prefix)
+        if not tsnaps:
+            return None, None
+        latest = tsnaps[-1]
+        for cand in snap_list(ds, self.prefix, "snapshot,bookmark"):
+            if cand["guid"] == latest["guid"]:
+                return cand["name"], latest["short"]
+        return None, latest["short"]
+
+    def plan(self, snap, datasets):
+        steps = []
+        need_full_reset = False
+        for ds in datasets:
+            tgt = self.tgt(ds)
+            token = resume_token(tgt)
+            base, tlatest = self.base_for(ds, tgt)
+            if tlatest == snap and not token:
+                steps.append({"ds": ds, "tgt": tgt, "type": "present", "est": 0})
+                continue
+            if token:
+                steps.append({"ds": ds, "tgt": tgt, "type": "resume", "token": token,
+                              "est": send_estimate(["-t", token])})
+                continue
+            if base:
+                steps.append({"ds": ds, "tgt": tgt, "type": "incremental", "base": base,
+                              "est": send_estimate(["-L", "-c", "-e", "-i", base, f"{ds}@{snap}"])})
+            elif ds_exists(tgt):
+                need_full_reset = True
+                steps.append({"ds": ds, "tgt": tgt, "type": "full", "est": 0})
+            else:
+                steps.append({"ds": ds, "tgt": tgt, "type": "full", "est": 0})
+        if need_full_reset:
+            # No common base for an existing target: start the whole drive over.
+            steps = [{"ds": ds, "tgt": self.tgt(ds), "type": "full", "est": 0} for ds in datasets]
+        for s in steps:
+            if s["type"] == "full":
+                s["est"] = send_estimate(["-L", "-c", "-e", f"{s['ds']}@{snap}"])
+        return steps, need_full_reset
+
+    def transfer(self, send_cmd, recv_cmd, done_before, total, label):
+        self.job.log(f"  {label}: {' '.join(send_cmd)}", echo=False)
+        send = subprocess.Popen(send_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        recv = subprocess.Popen(recv_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.job.procs = [send, recv]
+        errs = {"send": b"", "recv": b""}
+
+        def drain(name, stream):
+            errs[name] = stream.read()
+
+        threads = [threading.Thread(target=drain, args=("send", send.stderr), daemon=True),
+                   threading.Thread(target=drain, args=("recv", recv.stderr), daemon=True)]
+        for t in threads:
+            t.start()
+        done = 0
+        t0 = time.time()
+        window = []  # (time, bytes) for a rolling rate
+        fd = send.stdout.fileno()
+        try:
+            while True:
+                if self.job.cancelled:
+                    raise VSError("cancelled")
+                chunk = os.read(fd, CHUNK)
+                if not chunk:
+                    break
+                recv.stdin.write(chunk)
+                done += len(chunk)
+                now = time.time()
+                window.append((now, done))
+                while len(window) > 2 and now - window[0][0] > 20:
+                    window.pop(0)
+                span = now - window[0][0]
+                rate = (done - window[0][1]) / span if span > 1 else done / max(now - t0, 0.001)
+                self.job.progress(done_before + done, max(total, done_before + done), rate)
+        except BrokenPipeError:
+            pass
+        finally:
+            try:
+                recv.stdin.close()
+            except BrokenPipeError:
+                pass
+            if self.job.cancelled:
+                for p in (send, recv):
+                    if p.poll() is None:
+                        p.terminate()
+            recv.wait()
+            if send.poll() is None and recv.returncode != 0:
+                # receiver died; stop the sender so it doesn't block on a full pipe
+                send.terminate()
+            send.stdout.close()
+            send.wait()
+            for t in threads:
+                t.join(timeout=5)
+            self.job.procs = []
+        if send.returncode != 0 or recv.returncode != 0:
+            msg = (errs["recv"] or errs["send"]).decode(errors="replace").strip()
+            raise VSError(f"{label} failed: {msg or 'send/receive error'}")
+        return done
+
+    def run_pass(self, snap, datasets, done_before=0):
+        self.job.phase("planning", f"planning transfer to snapshot {snap}")
+        steps, reset = self.plan(snap, datasets)
+        total = done_before + sum(s["est"] for s in steps)
+        kinds = {s["type"] for s in steps}
+        fresh = reset or not ds_exists(self.target_root)
+        mode = "full" if fresh else "incremental" if kinds - {"present"} else "current"
+        if "resume" in kinds:
+            mode = "resume"
+        need = sum(s["est"] for s in steps)
+        free = imported_pools().get(self.pool, {}).get("free", 0)
+        if reset and ds_exists(self.target_root):
+            used = int(run(["zfs", "list", "-H", "-p", "-o", "used", self.target_root]).strip() or 0)
+            free += used
+        if need > free * 0.97:
+            raise VSError(f"backup needs about {human(need)} but the drive has {human(free)} available. "
+                          f"Use a larger drive or exclude datasets.")
+        self.job.log(f"mode: {mode}, about {human(need)} to copy, drive free {human(free)}")
+        self.job.update(force=True, mode=mode if done_before == 0 else self.job.data.get("mode", mode))
+        if reset and ds_exists(self.target_root):
+            self.job.phase("resetting", "no common snapshot with the drive; replacing the drive's copy")
+            run(["zfs", "destroy", "-r", self.target_root])
+        done = done_before
+        for s in steps:
+            if self.job.cancelled:
+                raise VSError("cancelled")
+            ds, tgt = s["ds"], s["tgt"]
+            if s["type"] == "present":
+                continue
+            self.job.update(force=True, phase=f"copying {ds}")
+            self.job.log(f"{s['type']} {ds} -> {tgt} (~{human(s['est'])})")
+            if s["type"] == "resume":
+                try:
+                    done += self.transfer(["zfs", "send", "-t", s["token"]],
+                                          ["zfs", "recv", "-s", "-u", tgt], done, total, ds)
+                except VSError as e:
+                    if self.job.cancelled:
+                        raise
+                    self.job.log(f"resume failed ({e}); discarding partial receive and retrying")
+                    run(["zfs", "recv", "-A", tgt], check=False)
+                    if resume_token(tgt):
+                        raise VSError(f"could not discard partial receive on {tgt}: {e}")
+                    return self.run_pass(snap, datasets, done)
+                # the resumed stream may have been an older snapshot; re-plan this dataset
+                base, tlatest = self.base_for(ds, tgt)
+                if tlatest == snap:
+                    continue
+                if not base:
+                    raise VSError(f"after resume, {tgt} has no common base; run sync again")
+                s = {"type": "incremental", "base": base}
+            if s["type"] == "incremental":
+                done += self.transfer(["zfs", "send", "-L", "-c", "-e", "-i", s["base"], f"{ds}@{snap}"],
+                                      ["zfs", "recv", "-s", "-u", "-F", tgt], done, total, ds)
+            elif s["type"] == "full":
+                done += self.transfer(["zfs", "send", "-L", "-c", "-e", f"{ds}@{snap}"],
+                                      ["zfs", "recv", "-s", "-u", tgt], done, total, ds)
+        return done, mode
+
+    def finalize(self, snap, datasets):
+        self.job.phase("finalizing", "creating bookmarks and pruning old snapshots")
+        for ds in datasets:
+            bm = f"{ds}#{snap}"
+            if not ds_exists(bm):
+                run(["zfs", "bookmark", f"{ds}@{snap}", bm])
+            for b in snap_list(ds, self.prefix, "bookmark"):
+                if b["short"] != snap:
+                    run(["zfs", "destroy", b["name"]], check=False)
+        # source snapshots for this drive (the bookmark is enough for next time)
+        for s in snap_list(self.src, self.prefix):
+            run(["zfs", "destroy", "-r", s["name"]], check=False)
+        # drive: keep only the newest snapshot
+        wanted = {self.tgt(ds) for ds in datasets}
+        out = run(["zfs", "list", "-H", "-o", "name", "-t", "filesystem,volume", "-r", self.target_root])
+        for tgt in sorted(out.splitlines(), reverse=True):
+            if tgt not in wanted:
+                if not any(w.startswith(tgt + "/") for w in wanted):
+                    self.job.log(f"removing {tgt} (no longer in source)")
+                    run(["zfs", "destroy", "-r", tgt], check=False)
+                continue
+            for s in snap_list(tgt, SNAP_PREFIX):
+                if s["short"] != snap:
+                    run(["zfs", "destroy", s["name"]], check=False)
+
+    def run(self):
+        cfg, job, pool = self.cfg, self.job, self.pool
+        datasets = source_datasets(cfg)
+        props = pool_props(pool)
+        if props.get("id") and props["id"] != self.drive_id:
+            raise VSError(f"pool {pool} has mismatched id {props['id']}")
+        label = props.get("label")
+        job.update(force=True, label=label)
+        remember_drive(pool, label=label)
+        cleanup_stale(cfg, log=job.log, keep_prefix=self.prefix)
+
+        total_done = 0
+        pending = props.get("pending")
+        if pending:
+            if ds_exists(f"{self.src}@{pending}"):
+                job.log(f"resuming interrupted sync to {pending}")
+                total_done, _ = self.run_pass(pending, datasets)
+                self.finalize(pending, datasets)
+                set_pool_props(pool, pending=None, last_snapshot=pending)
+            else:
+                job.log("previous interrupted sync can't resume (snapshot gone); discarding partial data")
+                out = run(["zfs", "list", "-H", "-o", "name", "-r", self.target_root], check=False)
+                for tgt in out.splitlines():
+                    if resume_token(tgt):
+                        run(["zfs", "recv", "-A", tgt], check=False)
+                set_pool_props(pool, pending=None)
+
+        if cfg.get("pre_snapshot_hook"):
+            job.phase("hook", f"running pre-snapshot hook: {cfg['pre_snapshot_hook']}")
+            p = subprocess.run(cfg["pre_snapshot_hook"], shell=True, capture_output=True, text=True,
+                               timeout=3600)
+            for line in (p.stdout + p.stderr).splitlines():
+                job.log(f"  hook: {line}", echo=False)
+            if p.returncode != 0:
+                raise VSError(f"pre-snapshot hook failed with exit code {p.returncode}")
+
+        snap = f"{self.prefix}{stamp()}"
+        job.phase("snapshot", f"snapshot {self.src}@{snap}")
+        run(["zfs", "snapshot", "-r", f"{self.src}@{snap}"])
+        set_pool_props(pool, pending=snap)
+        try:
+            done, mode = self.run_pass(snap, datasets, total_done)
+        except VSError as e:
+            if job.data.get("bytes_done", 0) == total_done and "cancelled" not in str(e):
+                # nothing was written for this snapshot; don't keep it pinned
+                run(["zfs", "destroy", "-r", f"{self.src}@{snap}"], check=False)
+                set_pool_props(pool, pending=None)
+            raise
+        self.finalize(snap, datasets)
+        set_pool_props(pool, pending=None, last_snapshot=snap, last_sync=now_iso())
+        if job.data.get("mode") == "resume":
+            mode = "resume"
+        job.data["result"] = {"drive_id": self.drive_id, "pool": pool, "label": label,
+                              "snapshot": snap, "mode": job.data.get("mode", mode),
+                              "bytes": done, "datasets": len(datasets)}
+        remember_drive(pool, label=label, last_sync=now_iso())
+        return done
+
+
+def cleanup_stale(cfg, log=print, keep_prefix=None):
+    """Destroy vaultsync snapshots on the source older than stale_snapshot_days
+    (left behind by interrupted syncs of drives that never came back) and any
+    plan snapshots."""
+    days = float(cfg.get("stale_snapshot_days", 14))
+    active = {j.get("pool") for j in active_jobs()}
+    removed = []
+    for s in snap_list(cfg["source"], SNAP_PREFIX):
+        if s["short"].startswith(PLAN_PREFIX):
+            age = stamp_age_days(s["short"])
+            if age is None or age > 0.05:
+                run(["zfs", "destroy", "-r", s["name"]], check=False)
+                removed.append(s["name"])
+            continue
+        m = re.match(r"^vaultsync-([0-9a-f]{8})-", s["short"])
+        if not m or f"{POOL_PREFIX}{m.group(1)}" in active:
+            continue
+        if keep_prefix and s["short"].startswith(keep_prefix):
+            continue
+        age = stamp_age_days(s["short"])
+        if age is not None and age > days:
+            log(f"removing stale snapshot {s['name']} ({age:.0f} days old)")
+            run(["zfs", "destroy", "-r", s["name"]], check=False)
+            removed.append(s["name"])
+    return removed
+
+
+# ---------------------------------------------------------------- job bodies
+
+
+def body_sync(job, cfg):
+    pool = job.data["params"]["pool"]
+    with Lock(pool):
+        job.phase("importing", f"importing {pool}")
+        we_imported = ensure_imported(pool)
+        try:
+            health = imported_pools().get(pool, {}).get("health")
+            if health != "ONLINE":
+                raise VSError(f"drive pool {pool} is {health}; run verify")
+            done = Syncer(job, cfg, pool).run()
+            if cfg.get("verify_after_sync"):
+                scrub(job, pool)
+        finally:
+            if we_imported or job.data["params"].get("export", True):
+                job.phase("exporting", "exporting drive pool")
+                if not export_pool(pool, job.log):
+                    job.log("WARNING: could not export pool; run 'vaultsync eject' before unplugging")
+    r = job.data["result"]
+    return (f"{r.get('mode', 'sync')} sync of {r.get('label') or pool} complete, "
+            f"{human(done)} copied. Safe to unplug.")
+
+
+def scrub(job, pool):
+    job.phase("verifying", f"scrubbing {pool}")
+    run(["zpool", "scrub", pool])
+    time.sleep(2)
+    while True:
+        if job.cancelled:
+            run(["zpool", "scrub", "-s", pool], check=False)
+            raise VSError("cancelled")
+        st = run(["zpool", "status", pool], check=False)
+        if "scrub in progress" not in st:
+            break
+        m = re.search(r"([\d.]+)% done", st)
+        pct = float(m.group(1)) if m else 0
+        size = imported_pools().get(pool, {}).get("alloc", 0)
+        job.update(percent=pct, bytes_total=size, bytes_done=int(size * pct / 100))
+        if job.echo:
+            sys.stdout.write(f"\r\033[K  scrub {pct:5.1f}%") if sys.stdout.isatty() else None
+            sys.stdout.flush()
+        time.sleep(5)
+    st = run(["zpool", "status", pool], check=False)
+    m = re.search(r"scrub repaired (\S+) in (\S+) with (\d+) errors", st)
+    errors = int(m.group(3)) if m else -1
+    set_pool_props(pool, last_verify=now_iso())
+    job.data["result"]["verify_errors"] = errors
+    if errors != 0:
+        raise VSError(f"scrub found {errors} error(s); this drive may be failing:\n{st}")
+    job.log(f"scrub clean ({m.group(1)} repaired in {m.group(2)})")
+
+
+def body_verify(job, cfg):
+    pool = job.data["params"]["pool"]
+    with Lock(pool):
+        job.phase("importing", f"importing {pool}")
+        we_imported = ensure_imported(pool)
+        try:
+            props = pool_props(pool)
+            job.update(force=True, label=props.get("label"))
+            job.data["result"] = {"drive_id": pool[len(POOL_PREFIX):], "pool": pool,
+                                  "label": props.get("label")}
+            scrub(job, pool)
+        finally:
+            if we_imported:
+                job.phase("exporting", "exporting drive pool")
+                export_pool(pool, job.log)
+    return "verify complete, no errors found. Safe to unplug."
+
+
+def body_init(job, cfg):
+    p = job.data["params"]
+    device, serial, label = p["device"], p["serial"], p["label"]
+    if not LABEL_RE.match(label or ""):
+        raise VSError("label must be 1-40 characters: letters, numbers, space, . _ -")
+    disks = {d["device"]: d for d in usb_disks(cfg)}
+    d = disks.get(device)
+    if not d:
+        raise VSError(f"{device} is not an attached USB disk")
+    if d["serial"] != serial:
+        raise VSError(f"serial mismatch for {device}: expected {serial}, found {d['serial']}")
+    if d["mounted"]:
+        raise VSError(f"{device} has mounted filesystems: {', '.join(d['mounted'])}")
+    if d["imported"]:
+        raise VSError(f"{device} belongs to imported pool {d['pool']}; export it first")
+    if d["port_mode"] == "ignored":
+        raise VSError("this drive is on a port marked ignored")
+    with Lock(f"init-{d['name']}"):
+        drive_id = secrets.token_hex(4)
+        pool = f"{POOL_PREFIX}{drive_id}"
+        job.update(force=True, pool=pool, label=label)
+        target = d["by_id"] or device
+        job.phase("wiping", f"erasing {device} ({d['model']} {d['serial']})")
+        for part in d["partitions"]:
+            if part.get("fstype") == "zfs_member":
+                run(["zpool", "labelclear", "-f", f"/dev/{part['name']}"], check=False)
+            run(["wipefs", "-a", f"/dev/{part['name']}"], check=False)
+        run(["wipefs", "-a", device])
+        if shutil.which("sgdisk"):
+            run(["sgdisk", "--zap-all", device], check=False)
+        run(["udevadm", "settle"], check=False)
+        job.phase("creating", f"creating pool {pool}")
+        run(["zpool", "create", "-f", "-o", "ashift=12", "-o", "cachefile=none",
+             "-O", "compression=lz4", "-O", "atime=off", "-O", "xattr=sa",
+             "-O", "canmount=off", "-O", "readonly=on",
+             "-O", f"mountpoint=/mnt/vaultsync/{drive_id}",
+             "-O", f"vaultsync:id={drive_id}", "-O", f"vaultsync:label={label}",
+             "-O", f"vaultsync:created={now_iso()}", "-O", f"vaultsync:serial={serial}",
+             pool, target])
+        remember_drive(pool, label=label, serial=serial, model=d["model"], created=now_iso())
+        job.data["result"] = {"drive_id": drive_id, "pool": pool, "label": label, "serial": serial,
+                              "model": d["model"], "size": d["size"]}
+        job.phase("exporting", "exporting new drive pool")
+        export_pool(pool, job.log)
+    return f"drive '{label}' ready as {pool}"
+
+
+def body_eject(job, cfg):
+    pool = job.data["params"].get("pool")
+    disk = None
+    for d in usb_disks(cfg):
+        if d["pool"] == pool:
+            disk = d
+    if not disk:
+        raise VSError(f"{pool} is not attached")
+    with Lock(pool):
+        if disk["imported"]:
+            job.phase("exporting", f"exporting {pool}")
+            if not export_pool(pool, job.log):
+                raise VSError(f"{pool} is busy and could not be exported")
+        run(["sync"], check=False)
+        job.phase("detaching", f"detaching {disk['device']}")
+        try:
+            with open(f"/sys/block/{disk['name']}/device/delete", "w") as f:
+                f.write("1")
+        except OSError as e:
+            job.log(f"could not detach disk ({e}); the pool is exported, it is still safe to unplug")
+    job.data["result"] = {"pool": pool, "drive_id": pool[len(POOL_PREFIX):]}
+    return f"{disk.get('label') or pool} ejected. Safe to unplug."
+
+
+BODIES = {"sync": body_sync, "verify": body_verify, "init": body_init, "eject": body_eject}
+
+
+def execute(job, cfg):
+    """Run a job in this process."""
+    job.update(force=True, status="running", started=now_iso(), pid=os.getpid())
+
+    def on_term(signum, frame):
+        job.cancelled = True
+        for p in job.procs:
+            if p.poll() is None:
+                p.terminate()
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    try:
+        msg = BODIES[job.data["kind"]](job, cfg)
+        job.finish("success", msg)
+        return 0
+    except VSError as e:
+        job.finish("cancelled" if job.cancelled else "failed", str(e))
+        return 2 if job.cancelled else 1
+    except Exception as e:  # noqa: BLE001
+        job.finish("failed", f"unexpected error: {e!r}")
+        raise
+
+
+def spawn(job):
+    """Start a job detached from the caller (used by the agent)."""
+    exe = os.path.realpath(sys.argv[0])
+    if shutil.which("systemd-run"):
+        cmd = ["systemd-run", f"--unit=vaultsync-{job.id}", "--collect", "--quiet",
+               f"--setenv=VAULTSYNC_CONFIG={CONFIG_PATH}", f"--setenv=VAULTSYNC_STATE={STATE_DIR}",
+               sys.executable, exe, "_run", job.id]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode == 0:
+            return
+    subprocess.Popen([sys.executable, exe, "_run", job.id], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def plan_drive(pool, cfg):
+    """Dry run: what would a sync of this drive do? Imports and exports the pool if needed."""
+    with Lock(pool):
+        we_imported = ensure_imported(pool)
+        try:
+            datasets = source_datasets(cfg)
+            syncer = Syncer(Job({"id": "plan", "params": {}}), cfg, pool)
+            props = pool_props(pool)
+            tmp = f"{PLAN_PREFIX}{stamp()}"
+            run(["zfs", "snapshot", "-r", f"{cfg['source']}@{tmp}"])
+            try:
+                steps, reset = syncer.plan(tmp, datasets)
+            finally:
+                run(["zfs", "destroy", "-r", f"{cfg['source']}@{tmp}"], check=False)
+            mode = "full" if reset or not ds_exists(syncer.target_root) else "incremental"
+            if props.get("pending"):
+                mode = "resume"
+            free = imported_pools().get(pool, {}).get("free", 0)
+            size = imported_pools().get(pool, {}).get("size", 0)
+            need = sum(s["est"] for s in steps)
+            if reset and ds_exists(syncer.target_root):
+                free += int(run(["zfs", "list", "-H", "-p", "-o", "used", syncer.target_root]).strip() or 0)
+            return {"pool": pool, "label": props.get("label"), "mode": mode, "reset": reset,
+                    "bytes": need, "drive_free": free, "drive_size": size, "fits": need <= free * 0.97,
+                    "last_sync": props.get("last_sync"), "pending": props.get("pending"),
+                    "datasets": [{"name": s["ds"], "type": s["type"], "bytes": s["est"]} for s in steps]}
+        finally:
+            if we_imported:
+                export_pool(pool)
+
+
+# ---------------------------------------------------------------- HTTP agent
+
+
+class AgentHandler(BaseHTTPRequestHandler):
+    server_version = f"vaultsync-agent/{VERSION}"
+
+    def log_message(self, fmt, *args):
+        if os.environ.get("VAULTSYNC_DEBUG"):
+            super().log_message(fmt, *args)
+
+    def _send(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _auth(self):
+        cfg = load_config()
+        allowed = cfg.get("allowed_clients") or []
+        if allowed and self.client_address[0] not in allowed:
+            self._send(403, {"error": f"client {self.client_address[0]} not allowed"})
+            return None
+        token = cfg.get("token")
+        got = self.headers.get("Authorization", "")
+        if not token or not secrets.compare_digest(got, f"Bearer {token}"):
+            self._send(401, {"error": "bad or missing token"})
+            return None
+        return cfg
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if not n:
+            return {}
+        return json.loads(self.rfile.read(n) or b"{}")
+
+    def do_GET(self):
+        self._dispatch("GET")
+
+    def do_POST(self):
+        self._dispatch("POST")
+
+    def do_PUT(self):
+        self._dispatch("PUT")
+
+    def _dispatch(self, method):
+        cfg = self._auth()
+        if cfg is None:
+            return
+        url = urlparse(self.path)
+        path = url.path.rstrip("/")
+        q = parse_qs(url.query)
+        try:
+            if method == "GET" and path == "/api/health":
+                return self._send(200, {"ok": True, "version": VERSION, "host": socket.gethostname(),
+                                        "source": cfg["source"]})
+            if method == "GET" and path == "/api/state":
+                return self._send(200, state(cfg))
+            if method == "GET" and path == "/api/jobs":
+                limit = int(q.get("limit", ["500"])[0])
+                return self._send(200, {"jobs": list_jobs(limit=limit)})
+            m = re.fullmatch(r"/api/jobs/([\w-]+)", path)
+            if method == "GET" and m:
+                return self._send(200, Job.load(m.group(1)).data)
+            m = re.fullmatch(r"/api/jobs/([\w-]+)/log", path)
+            if method == "GET" and m:
+                tail = int(q.get("tail", ["300"])[0])
+                lp = os.path.join(logs_dir(), f"{m.group(1)}.log")
+                lines = open(lp).read().splitlines()[-tail:] if os.path.exists(lp) else []
+                return self._send(200, {"lines": lines})
+            m = re.fullmatch(r"/api/jobs/([\w-]+)/cancel", path)
+            if method == "POST" and m:
+                return self._send(200, cancel_job(m.group(1)))
+            if method == "POST" and path == "/api/jobs":
+                return self._send(200, start_job(self._body(), cfg))
+            if method == "POST" and path == "/api/plan":
+                pool = self._body().get("pool", "")
+                if not POOL_RE.match(pool):
+                    raise VSError("bad pool name")
+                return self._send(200, plan_drive(pool, cfg))
+            if method == "POST" and path == "/api/cleanup":
+                return self._send(200, {"removed": cleanup_stale(cfg, log=lambda *_: None)})
+            if method == "PUT" and path == "/api/config":
+                return self._send(200, update_config(self._body()))
+            return self._send(404, {"error": "not found"})
+        except VSError as e:
+            return self._send(409, {"error": str(e)})
+        except Exception as e:  # noqa: BLE001
+            return self._send(500, {"error": repr(e)})
+
+
+_state_cache = {"t": 0, "data": None}
+_state_lock = threading.Lock()
+
+
+def state(cfg):
+    with _state_lock:
+        if time.time() - _state_cache["t"] < 2 and _state_cache["data"]:
+            return _state_cache["data"]
+        jobs = list_jobs(limit=50)
+        busy = {j.get("pool") for j in jobs if j.get("status") in ("running", "queued")}
+        disks = usb_disks(cfg)
+        for d in disks:
+            d["busy"] = d["pool"] in busy
+        data = {
+            "host": socket.gethostname(), "version": VERSION, "time": now_iso(),
+            "source": source_info(cfg), "ports": usb_ports(cfg), "disks": disks,
+            "jobs": jobs, "known": known_drives(),
+            "config": {k: cfg.get(k) for k in ("max_jobs", "verify_after_sync", "ports", "source",
+                                               "exclude", "stale_snapshot_days")},
+        }
+        _state_cache.update(t=time.time(), data=data)
+        return data
+
+
+def start_job(body, cfg):
+    kind = body.get("kind")
+    if kind not in BODIES:
+        raise VSError("unknown job kind")
+    with Lock("agent-start"):
+        if kind == "init":
+            label = (body.get("label") or "").strip()
+            if body.get("confirm") != label:
+                raise VSError("type the drive label to confirm erasing it")
+            params = {"device": body.get("device"), "serial": body.get("serial"), "label": label}
+            check_capacity(cfg)
+        else:
+            pool = body.get("pool", "")
+            if not POOL_RE.match(pool):
+                raise VSError("bad pool name")
+            params = {"pool": pool, "label": known_drives().get(pool, {}).get("label")}
+            if kind != "eject":
+                check_capacity(cfg, pool=pool)
+                disk = next((d for d in usb_disks(cfg) if d["pool"] == pool), None)
+                if not disk:
+                    raise VSError("drive is not attached")
+                if disk["port_mode"] == "ignored":
+                    raise VSError("drive is on a port marked ignored; move it to an active port")
+            elif any(j.get("pool") == pool for j in active_jobs()):
+                raise VSError("a job is running on this drive; cancel it first")
+        job = Job.create(kind, params, origin="dashboard")
+        spawn(job)
+        _state_cache["t"] = 0
+    return job.data
+
+
+def cancel_job(jid):
+    job = Job.load(jid)
+    pid = job.data.get("pid")
+    if job.data.get("status") not in ("running", "queued"):
+        raise VSError("job is not running")
+    if pid and pid_alive(pid):
+        os.kill(int(pid), signal.SIGTERM)
+    _state_cache["t"] = 0
+    return {"ok": True}
+
+
+def update_config(body):
+    cfg = load_config()
+    if "max_jobs" in body:
+        cfg["max_jobs"] = max(1, min(8, int(body["max_jobs"])))
+    if "verify_after_sync" in body:
+        cfg["verify_after_sync"] = bool(body["verify_after_sync"])
+    if "stale_snapshot_days" in body:
+        cfg["stale_snapshot_days"] = max(1, int(body["stale_snapshot_days"]))
+    if "ports" in body:
+        ports = {}
+        for key, v in (body["ports"] or {}).items():
+            mode = v.get("mode", "unconfigured")
+            if mode not in ("active", "slow", "ignored", "unconfigured"):
+                raise VSError(f"bad port mode {mode}")
+            ports[key] = {"name": str(v.get("name", ""))[:40], "mode": mode}
+        cfg["ports"] = ports
+    save_config(cfg)
+    _state_cache["t"] = 0
+    return {k: cfg.get(k) for k in ("max_jobs", "verify_after_sync", "ports", "stale_snapshot_days")}
+
+
+def cmd_agent(args, cfg):
+    if not cfg.get("token"):
+        sys.exit("no token in config; run the installer or set \"token\" in " + CONFIG_PATH)
+    addr = (args.listen or cfg["listen"], int(args.port or cfg["port"]))
+    srv = ThreadingHTTPServer(addr, AgentHandler)
+    print(f"vaultsync agent {VERSION} listening on {addr[0]}:{addr[1]}", flush=True)
+    srv.serve_forever()
+
+
+# ---------------------------------------------------------------- CLI
+
+
+def banner(text, ok=True):
+    color = "\033[1;32m" if ok else "\033[1;31m"
+    reset = "\033[0m"
+    if not sys.stdout.isatty():
+        color = reset = ""
+    line = "=" * max(40, len(text) + 4)
+    print(f"\n{color}{line}\n  {text}\n{line}{reset}\n")
+
+
+def run_foreground(kind, params, cfg):
+    if kind != "eject":
+        check_capacity(cfg, pool=params.get("pool"))
+    job = Job.create(kind, params, echo=True, origin="cli")
+    print(f"job {job.id}  (log: {job.log_path})")
+    rc = execute(job, cfg)
+    if sys.stdout.isatty():
+        sys.stdout.write("\r\033[K")
+    status = job.data["status"]
+    if status == "success":
+        banner("COMPLETE  " + job.data["message"], True)
+    else:
+        banner(f"{status.upper()}  {job.data['message']}", False)
+    return rc
+
+
+def cmd_status(args, cfg):
+    s = source_info(cfg)
+    print(f"source {s['name']}: {human(s['used'])} used, {human(s['avail'])} free")
+    for d in s["datasets"]:
+        print(f"   {'(excluded) ' if d['excluded'] else ''}{d['name']}  {human(d['refer'])}")
+    print()
+    cmd_drives(args, cfg)
+    print()
+    act = active_jobs()
+    print(f"running jobs: {len(act)}")
+    for j in act:
+        print(f"   {j['id']}  {j['kind']} {j.get('label') or j.get('pool') or ''}  "
+              f"{j.get('phase')}  {j.get('percent') or 0}%")
+
+
+def cmd_ports(args, cfg):
+    for p in usb_ports(cfg):
+        dev = p["device"]
+        what = "-"
+        if dev:
+            what = f"{dev['manufacturer']} {dev['product']}".strip() or dev["usb_id"]
+            what += f" @ {dev['speed']} Mb/s"
+        print(f"{p['key']:<22} max {p['max_speed']:>5} Mb/s  {p['mode']:<12} "
+              f"{p['name'] or '':<16} {what}")
+
+
+def cmd_drives(args, cfg):
+    disks = usb_disks(cfg)
+    if not disks:
+        print("no USB disks attached")
+    for d in disks:
+        kind = ("vaultsync " + d["pool"]) if d["vaultsync"] else \
+            ("other ZFS pool " + d["pool"]) if d["foreign_zfs"] else "not a vaultsync drive"
+        print(f"{d['device']:<10} {d['model']:<24} {d['serial']:<22} {human(d['size']):>8}  "
+              f"port {d['port']} ({d['speed']} Mb/s, {d['port_mode']})  {kind}"
+              f"{'  label=' + d['label'] if d['label'] else ''}")
+
+
+def cmd_init(args, cfg):
+    disks = {d["device"]: d for d in usb_disks(cfg)}
+    dev = args.device if args.device.startswith("/dev/") else f"/dev/{args.device}"
+    d = disks.get(dev)
+    if not d:
+        sys.exit(f"{dev} is not an attached USB disk (see 'vaultsync drives')")
+    print(f"\nThis will ERASE {dev}: {d['model']} serial {d['serial']} ({human(d['size'])})")
+    if d["partitions"]:
+        for p in d["partitions"]:
+            print(f"   {p['name']}  {human(p['size'])}  {p.get('fstype') or ''} {p.get('label') or ''}")
+    if not args.yes:
+        got = input(f"Type the new label '{args.label}' to confirm: ").strip()
+        if got != args.label:
+            sys.exit("not confirmed")
+    return run_foreground("init", {"device": dev, "serial": d["serial"], "label": args.label}, cfg)
+
+
+def cmd_sync(args, cfg):
+    d = find_drive(args.drive, cfg)
+    if d["port_mode"] == "ignored":
+        sys.exit("drive is on a port marked ignored; move it to an active port")
+    if d["speed"] and d["speed"] < 5000:
+        print(f"note: drive is connected at {d['speed']} Mb/s (USB 2); a full copy will be slow")
+    return run_foreground("sync", {"pool": d["pool"], "label": d["label"]}, cfg)
+
+
+def cmd_verify(args, cfg):
+    d = find_drive(args.drive, cfg)
+    return run_foreground("verify", {"pool": d["pool"], "label": d["label"]}, cfg)
+
+
+def cmd_eject(args, cfg):
+    d = find_drive(args.drive, cfg)
+    return run_foreground("eject", {"pool": d["pool"], "label": d["label"]}, cfg)
+
+
+def cmd_plan(args, cfg):
+    d = find_drive(args.drive, cfg)
+    p = plan_drive(d["pool"], cfg)
+    print(f"drive {p['label'] or p['pool']}: {p['mode']} sync, about {human(p['bytes'])} to copy, "
+          f"{human(p['drive_free'])} available on drive"
+          f"{'' if p['fits'] else '  -- WILL NOT FIT'}")
+    for s in p["datasets"]:
+        print(f"   {s['type']:<12} {s['name']:<40} {human(s['bytes'])}")
+
+
+def cmd_jobs(args, cfg):
+    for j in list_jobs(limit=args.limit):
+        print(f"{j['id']}  {j['kind']:<6} {j['status']:<9} {(j.get('label') or j.get('pool') or ''):<16} "
+              f"{j.get('finished') or j.get('started') or ''}  {j.get('message', '')[:70]}")
+
+
+def cmd_log(args, cfg):
+    lp = os.path.join(logs_dir(), f"{args.job}.log")
+    if not os.path.exists(lp):
+        sys.exit("no log for that job")
+    print(open(lp).read(), end="")
+
+
+def cmd_cancel(args, cfg):
+    print(cancel_job(args.job))
+
+
+def cmd_cleanup(args, cfg):
+    removed = cleanup_stale(cfg)
+    print(f"removed {len(removed)} snapshot(s)")
+
+
+def cmd_internal_run(args, cfg):
+    job = Job.load(args.job)
+    return execute(job, cfg)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="vaultsync", description="Rotating ZFS backups to USB drives")
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("ports").set_defaults(fn=cmd_ports)
+    sub.add_parser("drives").set_defaults(fn=cmd_drives)
+    p = sub.add_parser("init", help="ERASE a USB disk and make it a backup drive")
+    p.add_argument("device")
+    p.add_argument("--label", required=True)
+    p.add_argument("--yes", action="store_true", help="skip the typed confirmation")
+    p.set_defaults(fn=cmd_init)
+    for name, fn in (("sync", cmd_sync), ("plan", cmd_plan), ("verify", cmd_verify), ("eject", cmd_eject)):
+        p = sub.add_parser(name)
+        p.add_argument("drive", nargs="?", help="pool name, label or serial (default: the only attached drive)")
+        p.set_defaults(fn=fn)
+    p = sub.add_parser("jobs")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(fn=cmd_jobs)
+    p = sub.add_parser("log")
+    p.add_argument("job")
+    p.set_defaults(fn=cmd_log)
+    p = sub.add_parser("cancel")
+    p.add_argument("job")
+    p.set_defaults(fn=cmd_cancel)
+    sub.add_parser("cleanup").set_defaults(fn=cmd_cleanup)
+    p = sub.add_parser("agent")
+    p.add_argument("--listen")
+    p.add_argument("--port", type=int)
+    p.set_defaults(fn=cmd_agent)
+    p = sub.add_parser("_run")
+    p.add_argument("job")
+    p.set_defaults(fn=cmd_internal_run)
+    args = ap.parse_args(argv)
+    if os.geteuid() != 0 and not os.environ.get("VAULTSYNC_ALLOW_NONROOT"):
+        sys.exit("vaultsync must run as root")
+    cfg = load_config()
+    try:
+        return args.fn(args, cfg) or 0
+    except VSError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
