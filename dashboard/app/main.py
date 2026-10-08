@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS pending_inits (
   start_sync INTEGER, done INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS deleted_drives (id TEXT PRIMARY KEY, label TEXT, deleted_at TEXT);
 CREATE INDEX IF NOT EXISTS jobs_drive ON jobs(drive_id, finished);
 """
 DEFAULT_SETTINGS = {"warn_days": "30", "stale_days": "60"}
@@ -118,10 +119,13 @@ def ingest(jobs):
     """Copy agent job records into the local history, and finish pending drive setups."""
     started = []
     with db() as con:
+        deleted = {r["id"] for r in con.execute("SELECT id FROM deleted_drives")}
         for j in jobs:
             res = j.get("result") or {}
             pool = j.get("pool") or res.get("pool")
             drive_id = res.get("drive_id") or (pool[3:] if pool and pool.startswith("vs-") else None)
+            if drive_id in deleted:
+                continue  # history was deleted on purpose; don't bring it back from the host
             con.execute(
                 "INSERT INTO jobs(id, kind, drive_id, pool, status, mode, started, finished, bytes, message, origin, data)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,"
@@ -286,6 +290,7 @@ def adopt_drive(body: Adopt):
         raise HTTPException(400, "not a vaultsync pool")
     drive_id = body.pool[3:]
     with db() as con:
+        con.execute("DELETE FROM deleted_drives WHERE id=?", (drive_id,))
         if con.execute("SELECT 1 FROM drives WHERE id=?", (drive_id,)).fetchone():
             con.execute("UPDATE drives SET retired_at=NULL WHERE id=?", (drive_id,))
             return {"ok": True, "id": drive_id}
@@ -314,6 +319,35 @@ def edit_drive(drive_id: str, body: DriveEdit):
         if body.retired is not None:
             con.execute("UPDATE drives SET retired_at=? WHERE id=?", (now_iso() if body.retired else None, drive_id))
     return drive_detail(drive_id)
+
+
+class DeleteDrive(BaseModel):
+    confirm: str
+
+
+@app.delete("/api/drives/{drive_id}")
+def delete_drive(drive_id: str, body: DeleteDrive):
+    """Second step after retiring: remove a drive and all of its history."""
+    with db() as con:
+        d = get_drive(con, drive_id)
+        if not d["retired_at"]:
+            raise HTTPException(409, "retire the drive before deleting it")
+        if body.confirm.strip() != d["label"]:
+            raise HTTPException(400, "type the drive name to confirm")
+    host_note = None
+    try:
+        agent("POST", "/api/forget", {"pool": d["pool"]}, timeout=60)
+    except AgentError as e:
+        if e.status == 409:
+            raise HTTPException(409, str(e)) from None
+        host_note = f"the host couldn't be reached, so its copy of this drive's job logs was kept ({e})"
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO deleted_drives(id, label, deleted_at) VALUES (?,?,?)",
+                    (drive_id, d["label"], now_iso()))
+        con.execute("DELETE FROM jobs WHERE drive_id=?", (drive_id,))
+        con.execute("DELETE FROM custody WHERE drive_id=?", (drive_id,))
+        con.execute("DELETE FROM drives WHERE id=?", (drive_id,))
+    return {"ok": True, "label": d["label"], "note": host_note}
 
 
 class Custody(BaseModel):

@@ -235,6 +235,12 @@ class H(BaseHTTPRequestHandler):
                 PROBLEMS[:] = [{"pool": b["pool"], "health": "SUSPENDED", "label": KNOWN.get(b["pool"], {}).get("label"),
                                 "attached": True}] if b.get("on", True) else []
                 return self.send(200, {"ok": True})
+            if p == "/api/forget":
+                if any(ATTACHED[k] and d["pool"] == b["pool"] for k, d in DISKS.items()):
+                    return self.send(409, {"error": "unplug the drive before deleting it"})
+                JOBS[:] = [j for j in JOBS if j["pool"] != b["pool"]]
+                KNOWN.pop(b["pool"], None)
+                return self.send(200, {"pool": b["pool"], "zfs_objects_removed": 5, "jobs_removed": 3})
             if p == "/api/reconnect":
                 PROBLEMS[:] = [x for x in PROBLEMS if x["pool"] != b["pool"]]
                 return self.send(200, {"pool": b["pool"], "health": "ONLINE"})

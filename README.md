@@ -128,6 +128,7 @@ vaultsync eject Alpha
 vaultsync init /dev/sdX --label Charlie   # ERASES the disk
 vaultsync jobs | vaultsync log <job id> | vaultsync cancel <job id>
 vaultsync reconnect            # reattach a drive that was unplugged while in use
+vaultsync forget vs-xxxxxxxx   # delete the host's bookmarks and job history for a retired drive
 vaultsync cleanup              # remove leftover snapshots from interrupted syncs
 ```
 
@@ -145,6 +146,22 @@ Two drives on the same controller share its bandwidth. For two full-speed backup
 ### Capacity
 
 A drive has to hold the whole source. The dashboard warns when the data reaches 80% of a drive's capacity, and a sync that won't fit is refused before anything is copied. As `tank` grows past about 5.5 TB, the 6 TB drive will stop fitting. Retire it then, via **Edit → Retired**, and use larger drives. To leave a dataset out, add it to `"exclude"` in `/etc/vaultsync/config.json`.
+
+### Retiring and deleting drives
+
+Removing a drive takes two steps, so its history can't disappear by accident:
+
+1. **Retire it.** On the drive's page, choose **Edit → Retired**. A retired drive keeps all its history and moves to the bottom of the list.
+2. **Delete it.** A retired drive's page gets a **Delete drive** button. Type the drive's name to confirm.
+
+Deleting removes:
+- the drive's custody records and job history from the dashboard
+- its bookmarks and leftover snapshots on `tank`
+- its job logs on the host
+
+The drive has to be unplugged first. Deleting never touches the data on the drive itself.
+
+This is the cleanup to use after reformatting a drive. A reformatted disk gets a new pool id, so it shows up as a new drive, and the old entry can then be retired and deleted. From the shell, `vaultsync forget vs-xxxxxxxx` does the host-side part of the cleanup.
 
 ## If a drive is unplugged mid-backup
 
@@ -223,6 +240,7 @@ The engine tests cover:
 - two drives rotating independently
 - interrupted and resumed syncs
 - a drive unplugged mid-copy (stall detected, reconnect, resume)
+- forgetting a retired drive
 - too-small drives
 - a diverged drive being rebuilt
 - plan

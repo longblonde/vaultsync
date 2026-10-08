@@ -210,6 +210,17 @@ def test():
     assert removed == ["tank@vaultsync-dddd4444-20200101T000000Z"], removed
     print("ok  stale snapshot cleanup")
 
+    st = zstate()
+    st["pools"][B]["imported"] = False
+    zsave(st)
+    r = vs.forget_drive(B, vs.load_config())
+    st = zstate()
+    assert not any(b["name"].startswith("vaultsync-bbbb2222") for n in st["ds"] if n.startswith("tank")
+                   for b in st["ds"][n]["bms"]), "bookmarks for the forgotten drive should be gone"
+    assert not any(j.get("pool") == B for j in vs.list_jobs())
+    check_clean(A, "aaaa1111")
+    print(f"ok  forget a retired drive: {r}")
+
     jobs = vs.list_jobs()
     assert all(j["status"] in ("success", "failed") for j in jobs)
     print(f"\nall engine tests passed ({len(jobs)} jobs)")

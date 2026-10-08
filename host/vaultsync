@@ -16,6 +16,7 @@ Runs on the ZFS host (e.g. Proxmox). Standard library only.
   vaultsync log JOB_ID          show a job log
   vaultsync cancel JOB_ID       stop a running job
   vaultsync reconnect [POOL]    reattach a drive that was unplugged while in use
+  vaultsync forget POOL         delete the host's bookmarks and job history for a retired drive
   vaultsync cleanup             remove stale vaultsync snapshots from the source
   vaultsync agent               run the HTTP agent used by the dashboard
 
@@ -1372,6 +1373,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                 if not POOL_RE.match(pool):
                     raise VSError("bad pool name")
                 return self._send(200, plan_drive(pool, cfg))
+            if method == "POST" and path == "/api/forget":
+                return self._send(200, forget_drive(self._body().get("pool", ""), cfg))
             if method == "POST" and path == "/api/reconnect":
                 return self._send(200, reconnect_pool(self._body().get("pool", "")))
             if method == "POST" and path == "/api/cleanup":
@@ -1625,6 +1628,52 @@ def cmd_cancel(args, cfg):
     print(cancel_job(args.job))
 
 
+def forget_drive(pool, cfg):
+    """Remove everything the host keeps about a drive: its bookmarks and leftover
+    snapshots on the source, its job records and logs, and its cached label.
+    The drive itself is not touched."""
+    if not POOL_RE.match(pool or ""):
+        raise VSError("bad pool name")
+    if any(d["pool"] == pool for d in usb_disks(cfg)):
+        raise VSError("unplug the drive before deleting it")
+    if pool in imported_pools():
+        raise VSError(f"{pool} is still imported; eject or reconnect it first")
+    if any(j.get("pool") == pool for j in active_jobs()):
+        raise VSError("a job is running for this drive")
+    prefix = f"{SNAP_PREFIX}{pool[len(POOL_PREFIX):]}-"
+    removed = 0
+    for s in snap_list(cfg["source"], prefix):
+        run(["zfs", "destroy", "-r", s["name"]], check=False)
+        removed += 1
+    for ds in source_datasets(cfg):
+        for b in snap_list(ds, prefix, "bookmark"):
+            run(["zfs", "destroy", b["name"]], check=False)
+            removed += 1
+    jobs = 0
+    for j in list_jobs():
+        if j.get("pool") == pool or (j.get("result") or {}).get("pool") == pool:
+            for path in (os.path.join(jobs_dir(), f"{j['id']}.json"), os.path.join(logs_dir(), f"{j['id']}.log")):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+            jobs += 1
+    known = known_drives()
+    if known.pop(pool, None) is not None:
+        atomic_write_json(known_path(), known)
+    _state_cache["t"] = 0
+    return {"pool": pool, "zfs_objects_removed": removed, "jobs_removed": jobs}
+
+
+def cmd_forget(args, cfg):
+    if not args.yes:
+        got = input(f"Delete everything the host keeps about {args.pool}? Type the pool name: ").strip()
+        if got != args.pool:
+            sys.exit("not confirmed")
+    r = forget_drive(args.pool, cfg)
+    print(f"removed {r['zfs_objects_removed']} bookmark(s)/snapshot(s) and {r['jobs_removed']} job record(s)")
+
+
 def cmd_reconnect(args, cfg):
     pools = [args.drive] if args.drive else [
         n for n, p in imported_pools().items() if POOL_RE.match(n) and p["health"] not in ("ONLINE", "DEGRADED")]
@@ -1680,6 +1729,10 @@ def main(argv=None):
     p.add_argument("job")
     p.set_defaults(fn=cmd_cancel)
     sub.add_parser("cleanup").set_defaults(fn=cmd_cleanup)
+    p = sub.add_parser("forget", help="delete the host's bookmarks and job history for a drive")
+    p.add_argument("pool")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(fn=cmd_forget)
     p = sub.add_parser("reconnect", help="reattach a drive that was unplugged while in use")
     p.add_argument("drive", nargs="?")
     p.set_defaults(fn=cmd_reconnect)

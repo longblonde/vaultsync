@@ -326,7 +326,8 @@ async function renderDetail(force) {
     <div class="section-head"><div><h1>${esc(d.label)}</h1>
       <p class="lede">${d.attached ? "Connected now." : "Not connected."} ${d.last_sync ? `Last backup ${fmtDate(d.last_sync)} (${daysSince(d.last_sync)} days ago).` : "Never backed up."}</p></div>
       <div class="dock-actions"><button data-act="custody" data-id="${d.id}">Hand off</button>
-      <button class="quiet" data-act="edit" data-id="${d.id}">Edit</button></div></div>
+      <button class="quiet" data-act="edit" data-id="${d.id}">Edit</button>
+      ${d.retired_at ? `<button class="danger" data-act="delete" data-id="${d.id}">Delete drive</button>` : ""}</div></div>
     ${d.attached ? `<div class="ledger"><div class="drive attached" style="padding-top:18px">${dock(d)}</div></div>` : ""}
     <div class="detail-grid">
       <div class="panel card-pad"><h2>Custody</h2>${custody}
@@ -595,7 +596,7 @@ function editModal(id) {
     <div class="modal-body">
       <label class="field">Drive name<input name="label" required value="${esc(d.label)}" maxlength="40"></label>
       <label class="field">Notes<textarea name="notes">${esc(d.notes || "")}</textarea></label>
-      <label class="check"><input type="checkbox" name="retired" ${d.retired_at ? "checked" : ""}> Retired (keep its history but move it to the bottom of the list)</label>
+      <label class="check"><input type="checkbox" name="retired" ${d.retired_at ? "checked" : ""}> Retired (keep its history but move it to the bottom of the list; a retired drive can then be deleted)</label>
       <div class="err" id="f-err"></div></div>
     <div class="modal-foot"><button type="button" data-close>Cancel</button><button class="primary" type="submit">Save changes</button></div></form>`, (root) => {
     root.querySelector("[data-close]").onclick = closeModal;
@@ -606,6 +607,34 @@ function editModal(id) {
         await api("PATCH", `/api/drives/${id}`, { label: f.get("label"), notes: f.get("notes"), retired: !!f.get("retired") });
         closeModal(); toast("Changes saved"); detail = null; poll.now();
       } catch (ex) { root.querySelector("#f-err").textContent = ex.message; }
+    };
+  });
+}
+
+function deleteModal(id) {
+  const d = detail && detail.id === id ? detail : S.drives.find((x) => x.id === id);
+  openModal(`<form><div class="modal-head"><h2>Delete ${esc(d.label)}</h2>
+      <p>Removes this drive from the list for good, along with its custody records and backup history. Use this for a drive that was reformatted or thrown away.</p></div>
+    <div class="modal-body">
+      <div class="erase"><strong>This can't be undone.</strong>
+        <div>The data on the drive itself is not touched. If the drive still holds a backup and is plugged in later, it can be added back, but its history won't return.</div>
+        <label class="field">Type the drive name to confirm<input name="confirm" required autocomplete="off"></label></div>
+      <div class="err" id="f-err"></div></div>
+    <div class="modal-foot"><button type="button" data-close>Cancel</button><button class="danger" type="submit">Delete drive and history</button></div></form>`, (root) => {
+    root.querySelector("[name=confirm]").focus();
+    root.querySelector("[data-close]").onclick = closeModal;
+    root.querySelector("form").onsubmit = async (e) => {
+      e.preventDefault();
+      const confirm = new FormData(e.target).get("confirm").trim();
+      const err = root.querySelector("#f-err");
+      if (confirm !== d.label) { err.textContent = "The confirmation doesn't match the drive name."; return; }
+      try {
+        e.submitter.disabled = true;
+        const r = await api("DELETE", `/api/drives/${id}`, { confirm });
+        closeModal(); detail = null;
+        toast(r.note ? `${d.label} deleted; ${r.note}` : `${d.label} deleted`);
+        location.hash = "#/";
+      } catch (ex) { err.textContent = ex.message; e.submitter.disabled = false; }
     };
   });
 }
@@ -647,6 +676,7 @@ document.addEventListener("click", async (e) => {
       catch (ex) { toast(ex.message); }
       return poll.now();
     }
+    if (act === "delete") return deleteModal(id);
     if (act === "custody") return custodyModal(id);
     if (act === "edit") return editModal(id);
     if (act === "cancel") return confirmModal("Stop this job?", "A stopped backup can be resumed: the next backup to this drive continues where this one stopped.", "Stop job", async () => { await api("POST", `/api/jobs/${job}/cancel`); toast("Stopping…"); }, true);
